@@ -1,1657 +1,845 @@
 # Open MC Server 프로젝트 기획
 
+> 상태: 구현 전 설계안. 정책은 개발 기준이며, 지원 조합·인증 연동·성능·운영 비용은 아직 검증되지 않았다.
+> 개정일: 2026-09-28. 버전별 기능 범위는 39~43절, 미확정 결정은 47절, 출시 완료 기준은 48절을 기준으로 한다.
+> 수치는 별도 표시가 없으면 초기 설계 목표다. 실측 후 변경할 때 근거와 영향을 결정 기록에 남긴다.
+
+빠른 이동: [인증](#12-사용자-인증과-게임-신원-연결) · [장애 대응](#34-장애-처리표) · [개발 단계](#38-개발-단계와-통과-조건) · [0.1 범위](#39-publicroom-01-mvp) · [미확정 결정](#47-구현-전-결정-기록과-미확정-항목) · [출시 검증](#48-검증과-출시-완료-기준)
+
 ## 1. 프로젝트 개요
 
-### 프로젝트명
+**Open MC Server**는 Minecraft 싱글플레이 월드를 포트포워딩과 IP 공유 없이 공개하고, 다른 사용자가 공개방 목록에서 찾아 참가하는 플랫폼이다.
 
-**Open MC Server**
+- 제품·저장소 이름: Open MC Server.
+- PublicRoom: 공개방 기능과 내부 프로토콜 이름. 코드 namespace는 publicroom을 유지한다.
+- Host: 월드를 실행하는 사용자. Player: Relay를 통해 들어오는 원격 참가자.
+- Room: 실행 중인 임시 방. WorldProfile: 재개설해도 유지하는 호스트 소유의 월드 관리 단위.
+- Admission: 참가 승인과 자리 예약. Session: 실제 게임 연결.
 
-### 목표
-
-Minecraft에서 별도의 서버 구축, 포트포워딩, IP 공유 없이 사용자가 자신의 싱글플레이 월드를 공개하고 다른 플레이어가 공개방 목록에서 해당 월드를 찾아 바로 참가할 수 있도록 한다.
-
-기본 사용자 흐름은 다음과 같다.
-
-```text
-싱글플레이 월드 실행
-→ 공개방 열기
-→ 중앙 공개방 목록 등록
-→ 다른 사용자가 방 검색
-→ 참가 버튼 클릭
-→ Relay를 통한 안전한 연결
-→ 멀티플레이 시작
-```
-
-### 핵심 가치
-
-1. **접근성**
-   - 포트포워딩 불필요
-   - 서버 구축 불필요
-   - IP 직접 입력 불필요
-   - 원클릭 참가
+기본 흐름:
 
-2. **발견성**
-   - 공개방 목록 제공
-   - 검색 및 필터
-   - 태그 기반 탐색
+~~~text
+싱글플레이 월드 실행 → 계정 확인 → 백업 선택 → 공개방 열기
+→ Host 터널 준비 → 목록 게시 → 참가 승인 → Relay 연결 → 게임 입장
+~~~
 
-3. **보안**
-   - Host IP 보호
-   - 참가자 IP 보호
-   - Relay 기반 통신
-   - 일회성 참가 인증
-   - DDoS 및 Abuse 대응
+핵심 가치는 접근성, 공개방 발견, 상대 플레이어에 대한 IP 비공개다. 월드의 실행과 저장은 호스트 PC가 담당하며, 호스트가 게임을 종료하면 다른 참가자의 플레이도 종료된다. 상시 서버와 호스트 이전은 0.1 범위에 포함하지 않는다.
 
----
+## 2. 전체 시스템 구성
 
-# 2. 전체 시스템 구성
+| 구성 요소 | 책임 | 권한 경계 |
+| --- | --- | --- |
+| Minecraft Mod | UI, Integrated Server 연결, 계정 연동, 월드 보호, Host Guard | 클라이언트의 자기 신고 값을 계정 소유 증명으로 사용하지 않음 |
+| Control Backend | 계정 검증, Room 관리, 참가 승인, 정원 예약, 제재, Relay 배정 | 게임 트래픽을 전달하지 않음 |
+| Relay | 인증된 연결 중계, 전송량·연결 수 제한, 연결 상태 보고 | 게임 내용과 플레이어 권한의 판정 주체가 아님 |
+| 운영 도구 | 신고 검토, 계정 제한, 방 종료, 용량·비용·장애 관찰 | 운영자 권한 분리와 감사 기록 적용 |
 
-PublicRoom은 크게 다음 네 영역으로 구성한다.
+Backend와 Relay는 별도 프로세스·배포·자원 한도를 갖는다. API 트래픽과 게임 트래픽이 같은 장애 원인을 공유하지 않도록 배포하며, 공통 DB·인증 공급자·네트워크 장애는 별도로 다룬다.
 
-```text
-PublicRoom
-├─ Minecraft Mod
-├─ Control Backend
-├─ Relay Network
-└─ Management / Moderation
-```
+## 3. Minecraft 사용자 기능
 
-## Minecraft Mod
+0.1 메뉴는 공개방 목록, 새로고침, 방 상세, 참가와 호스트 관리 화면을 제공한다. 검색·태그·사용자 선택 정렬·즐겨찾기는 0.2다.
 
-실제 사용자가 Minecraft 안에서 사용하는 클라이언트 기능이다.
+목록 항목에는 방 이름, 호스트 표시명, 호스트를 포함한 인원, 정확한 Minecraft 버전, 참가 가능 여부, 지연 추정치를 표시한다. 목록은 페이지 단위로 가져오며, 호환되지 않는 방은 이유와 함께 참가 버튼을 비활성화한다.
 
-주요 기능:
+연결 상태는 다음과 같이 표시한다.
 
-- 공개방 목록
-- 공개방 검색
-- 방 생성
-- 방 참가
-- 방 관리
-- 플레이어 관리
-- 연결 상태 표시
-- 신고 및 차단
-- 친구 및 초대 기능
-- Integrated Server 연동
-
----
-
-## Control Backend
-
-게임 패킷을 전달하지 않고 서비스 상태를 관리한다.
-
-주요 기능:
-
-- 사용자 인증
-- Minecraft 계정 확인
-- 사용자 관리
-- Room 생성 및 삭제
-- Room 검색
-- Room Heartbeat
-- Join Ticket 발급
-- Relay 서버 배정
-- Rate Limit
-- Abuse Detection
-- 신고 및 제재
-
----
-
-## Relay Network
-
-Host와 참가자 간 Minecraft 트래픽을 중계한다.
+~~~text
+계정 확인 중 → 참가 승인 중 → Relay 연결 중 → 월드 입장 중 → 플레이 중
+~~~
 
-```text
-Host Minecraft
-      │
-      │ Encrypted Tunnel
-      ▼
-    Relay
-      ▲
-      │ Encrypted Tunnel
-      │
-Player Minecraft
-```
-
-PublicRoom의 핵심 네트워크 인프라이다.
-
-주요 역할:
-
-- Host IP 은닉
-- 참가자 IP 은닉
-- NAT 및 공유기 환경 우회
-- 포트포워딩 제거
-- 연결 수 제한
-- Traffic Rate Limit
-- 비정상 연결 차단
-- Room별 Session 격리
-
----
-
-## Management / Moderation
-
-서비스 운영자가 사용하는 관리 시스템이다.
-
-주요 기능:
-
-- 신고 확인
-- 사용자 제재
-- 방 강제 종료
-- Room 생성 제한
-- Relay 사용 제한
-- Abuse 탐지
-- 서버 및 Relay 상태 확인
-- 통계 및 Monitoring
-
----
-
-# 3. Minecraft 사용자 기능
-
-## 3.1 공개방 메뉴
-
-Minecraft 메인 메뉴 또는 멀티플레이 메뉴에 PublicRoom 진입점을 추가한다.
-
-```text
-[싱글플레이]
-[멀티플레이]
-[공개방]
-[설정]
-```
-
-공개방 화면 예시:
-
-```text
-┌─────────────────────────────────────┐
-│ 공개방                              │
-│                                     │
-│ [검색...........................]    │
-│                                     │
-│ 기원의 야생               4 / 8     │
-│ Survival · 1.21.x · 24 ms           │
-│ #생존 #건축                [참가]    │
-│                                     │
-│ Skyblock 같이 해요        2 / 4     │
-│ Skyblock · 1.21.x · 31 ms            │
-│                            [참가]    │
-└─────────────────────────────────────┘
-```
-
-지원 기능:
-
-- 방 목록
-- 검색
-- 새로고침
-- 정렬
-- 필터
-- Room 상세 정보
-- 참가
-- 즐겨찾기
-
----
-
-# 4. 공개방 생성
-
-싱글플레이 월드 실행 중 다음 메뉴를 제공한다.
-
-```text
-ESC
-→ 공개방 열기
-```
-
-설정 가능한 항목:
-
-```text
-방 이름
-방 설명
-최대 인원
-
-게임 모드
-난이도
-
-공개 범위
-├─ 공개
-├─ 비밀번호
-├─ 친구 전용
-├─ 초대 전용
-└─ 비공개 링크
-
-태그
-├─ 생존
-├─ 건축
-├─ PvP
-├─ 미니게임
-└─ 기타
-```
-
-방을 생성하면 내부적으로 다음 과정이 수행된다.
-
-```text
-Integrated Server 준비
-        ↓
-Backend에 Room 생성 요청
-        ↓
-Relay 서버 할당
-        ↓
-Host Tunnel Token 발급
-        ↓
-Host → Relay Tunnel 연결
-        ↓
-Room 활성화
-        ↓
-공개방 목록 노출
-```
-
-사용자는 자신의 IP나 포트를 직접 설정하지 않는다.
-
----
-
-# 5. 방 관리
-
-Host는 공개방 생성 후 별도의 관리 화면을 사용할 수 있다.
-
-```text
-공개방 관리
-
-기원의 야생
-
-상태
-● 공개 중
-
-플레이어
-4 / 8
-
-접속자
-- Giwon
-- Steve
-- Alex
-- Player123
-
-[플레이어 관리]
-[공개 설정 변경]
-[초대 코드]
-[방 닫기]
-```
-
-플레이어 관리 기능:
-
-- Kick
-- Ban
-- 신고
-- 차단
-- 권한 관리
-
-향후 추가:
-
-- OP 권한
-- Whitelist
-- 친구 등록
-- Host 승인제
-
----
-
-# 6. 참가 기능
-
-사용자는 IP 주소를 입력하지 않는다.
-
-```text
-공개방 선택
-→ 참가
-```
-
-실제 연결 과정:
-
-```text
-Client
-  ↓
-Backend에 Join 요청
-  ↓
-사용자 및 Room 검증
-  ↓
-Join Ticket 발급
-  ↓
-Relay 접속
-  ↓
-Ticket 검증
-  ↓
-Host Tunnel 연결
-  ↓
-Minecraft Session 시작
-```
-
----
-
-# 7. 네트워크 기본 정책
-
-## Public Room은 Relay Only
-
-공개방에서는 P2P Direct Connection을 사용하지 않는다.
-
-```text
-Host
- │
- │ outbound encrypted tunnel
- ▼
-Relay
- ▲
- │ encrypted tunnel
- │
-Player
-```
-
-공개방에서 사용하지 않는 기술:
-
-- 직접 Port Forwarding
-- UPnP
-- NAT-PMP
-- STUN 기반 직접 연결
-- NAT Hole Punching
-- ICE P2P Candidate 교환
-
-이유는 Host IP 및 참가자 IP 노출 가능성을 제거하기 위해서이다.
-
----
-
-# 8. 유명인 및 스트리머 IP 보호
-
-PublicRoom의 핵심 보안 목표 중 하나이다.
-
-참가자에게 다음 정보를 절대 전달하지 않는다.
-
-```text
-Host Public IPv4
-Host IPv6
-Host Local IP
-Host Minecraft Port
-```
-
-참가자에게 전달되는 정보는 다음 정도로 제한한다.
-
-```text
-roomId
-joinTicket
-relayEndpoint
-expiration
-```
-
-예:
-
-```json
-{
-  "roomId": "rm_f39a2",
-  "joinTicket": "...",
-  "relay": "kr-03.relay.example.com",
-  "expiresAt": 1790520134
-}
-```
-
-참가자는 Relay의 주소만 확인할 수 있으며 Host의 실제 네트워크 주소는 알 수 없다.
-
----
-
-# 9. Room 데이터 구조
-
-예시:
-
-```text
-Room
-├─ id
-├─ hostId
-├─ name
-├─ description
-├─ minecraftVersion
-├─ publicRoomVersion
-├─ currentPlayers
-├─ maxPlayers
-├─ gameMode
-├─ tags
-├─ relayRegion
-├─ visibility
-├─ createdAt
-└─ lastHeartbeat
-```
-
----
-
-# 10. Public API 데이터 분리
-
-Database 객체를 그대로 Client에 전달하지 않는다.
-
-```text
-Database Model
-≠
-Public API Model
-```
-
-예:
-
-```text
-PublicRoomInfo
-├─ roomId
-├─ roomName
-├─ hostDisplayName
-├─ playerCount
-├─ maxPlayers
-├─ minecraftVersion
-├─ tags
-└─ ping
-```
-
-다음과 같은 내부 정보는 포함하지 않는다.
-
-```text
-Host IP
-Player IP
-내부 Relay ID
-Host Tunnel Token
-DB 내부 ID
-Email
-내부 Abuse 정보
-```
-
----
-
-# 11. Room 생명주기
-
-Room은 영구 객체가 아니라 Lease 형태로 관리한다.
-
-정상 상태:
-
-```text
-CREATE
-  ↓
-ACTIVE
-  ↓
-CLOSING
-  ↓
-CLOSED
-```
-
-비정상 종료:
-
-```text
-ACTIVE
-  ↓
-UNHEALTHY
-  ↓
-EXPIRED
-```
-
-예시 정책:
-
-```text
-Heartbeat: 5초
-
-15초 이상 미응답
-→ UNHEALTHY
-
-30초 이상 미응답
-→ EXPIRED
-→ Room 목록 제거
-```
+취소 버튼, 단계별 제한시간, 재시도 가능한 오류를 제공한다. 네트워크 대기·압축·백업 작업으로 렌더링 스레드를 막지 않는다. 사용자 안내에는 내부 토큰이나 네트워크 주소를 노출하지 않는다.
 
-Minecraft가 강제 종료되더라도 유령 방이 계속 남지 않는다.
+## 4. 공개방 생성과 Integrated Server 연결
 
----
+0.1 설정은 방 이름·설명, 최대 인원, 참가자의 기본 게임 모드, 월드 난이도다. 공개 범위는 PUBLIC + OPEN만 제공한다. 최대 인원은 호스트 포함 2~8명이며 기본값은 8명이다. 최초 공개 때 월드 변경 가능성과 호스트 종료 시 접속 종료를 안내한다.
 
-# 12. 사용자 인증
+생성 순서:
 
-익명 사용자가 공개방을 무제한 생성하지 못하도록 Minecraft 계정 기반 인증을 사용한다.
+1. 계정 인증과 지원 조합을 확인하고 호스트 소유 WorldProfile을 선택한다.
+2. 최초 공개 시 기본 선택된 백업을 실행하거나 사용자가 명시적으로 건너뛴다.
+3. Integrated Server와 로컬 연결 어댑터를 준비한다.
+4. Backend가 계정당 방 1개 조건을 확인하고 CREATING Room과 Relay 배정을 만든다.
+5. Host가 단기 Host Tunnel Token으로 Relay 제어 터널을 연결한다.
+6. Relay의 터널 준비 확인과 Host의 게임 수신 준비 확인을 모두 받으면 ACTIVE로 전환한다.
+7. 그 후 목록 게시와 참가 승인을 시작한다.
 
-기본 사용자 식별값:
+**연결 기본안:** 호스트 Mod의 어댑터가 loopback 전용 게임 수신 지점에 연결한다. 일반 LAN 공개 동작을 그대로 사용하는 것은 완료 조건으로 인정하지 않는다. 외부 인터페이스 바인딩과 LAN 광고를 비활성화하고, 로컬 연결도 승인된 세션에만 결합한다. 참가자 측도 loopback 어댑터를 사용한다.
 
-```text
-Minecraft UUID
-```
-
-구조:
-
-```text
-Minecraft Account
-        ↓
-Authentication
-        ↓
-Minecraft UUID
-        ↓
-PublicRoom User
-```
-
-초기 버전에서는 PublicRoom 자체 ID/PW 계정을 따로 만들지 않는 방향을 우선 고려한다.
-
----
-
-# 13. Join Ticket
-
-Room 참가 시 실제 연결 정보를 직접 전달하지 않고 일회성 Join Ticket을 발급한다.
-
-```text
-POST /rooms/{roomId}/join
-```
-
-응답:
-
-```text
-roomId
-relay
-joinTicket
-expiresAt
-```
-
-Ticket에 포함되는 정보:
-
-```text
-roomId
-playerId
-relayId
-expiration
-nonce
-signature
-```
-
-예상 유효시간:
-
-```text
-20~30초
-```
-
-Ticket은 기본적으로 한 번만 사용할 수 있다.
-
-```text
-첫 번째 사용
-→ ACCEPT
-
-동일 Ticket 재사용
-→ DENY
-```
-
----
-
-# 14. Host Tunnel Token
-
-Host 역시 임의의 Room으로 Relay를 등록할 수 없어야 한다.
-
-방 생성 시 Backend에서:
-
-```text
-roomId
-relayEndpoint
-hostTunnelToken
-```
+Phase 0에서 이 방식이 대상 버전의 로그인·암호화·일시정지 동작을 보존하는지 확인한다. 불가능하면 프로세스 내부 채널 방식과 비교해 ADR-002에 대안을 기록한다. 검증 전에는 어느 방식도 구현 완료로 표시하지 않는다.
 
-을 발급한다.
+생성 제한시간은 60초다. 실패하면 터널·로컬 리스너·예약을 정리하고 Room을 EXPIRED로 만든다. Room 재생성은 새 roomId를 사용한다. 생성 재시도에는 같은 멱등 키를 사용하며, 실패한 작업이 중복 방으로 남지 않아야 한다.
 
-Host는 다음 정보를 이용해서 Relay에 연결한다.
+공개 중 ESC 메뉴를 열어도 서버 tick은 계속 진행한다. 월드 나가기와 정상 종료는 먼저 방을 닫고 저장한다. 절전·비정상 종료는 34절을 따른다. 기존 LAN 공개가 켜진 월드는 이를 종료하기 전 공개방을 열 수 없도록 한다.
 
-```text
-roomId
-hostTunnelToken
-```
-
-Relay는 Token을 검증한 뒤에만 해당 Room용 Host Tunnel을 생성한다.
+## 5. 방 관리와 월드 보호
 
----
-
-# 15. 연결 종료 보안
-
-정상적인 방 종료:
-
-```text
-Host: Close Room
-      ↓
-Room → CLOSING
-      ↓
-신규 Join 차단
-      ↓
-활성 Join Ticket 폐기
-      ↓
-Player Session 종료
-      ↓
-Relay Mapping 제거
-      ↓
-Host Tunnel 종료
-      ↓
-Room → CLOSED
-```
+0.1 호스트 기능:
 
-비정상 종료:
+- 현재 접속자·예약 중인 인원·연결 상태 확인.
+- 신규 참가 일시 중지와 재개.
+- Kick, 기간제 Ban, 해제 전까지 유지되는 Ban.
+- 신고, 밴 목록 확인과 해제.
+- 방 이름·설명·정원 변경, 방 닫기.
+- 백업 결과 확인과 월드 재개설.
 
-```text
-Minecraft Crash
-또는
-Internet Disconnect
-      ↓
-Host Tunnel Lost
-      ↓
-Relay 감지
-      ↓
-신규 Join 차단
-      ↓
-기존 Session 정리
-      ↓
-Room 자동 만료
-```
-
-종료된 Room의 Token과 Session은 재사용하지 않는다.
-
----
-
-# 16. 공개방 Spam 방지
+참가자는 기본적으로 OP가 아니며 관리 권한을 부여받지 않는다. 게임 모드 선택은 권한 부여와 구분한다. OP 관리 UI와 세분화한 권한 관리는 후속 기능이다. 정원을 현재 인원과 예약의 합보다 작게 변경하는 요청은 거절한다. 연결 중인 슬롯도 이 합에 포함한다.
 
-악의적인 사용자가 수천~수만 개의 Room을 생성하는 공격을 고려한다.
+백업은 저장 완료와 일관성이 확보된 월드 상태에서 만든다. 단순히 실행 중 파일을 복사해 성공으로 표시하지 않는다. 초기 보존 한도는 월드별 최근 3개와 총 5GiB를 모두 만족하도록 한다. 자동으로 삭제할 수 있는 것은 서비스가 만든 백업뿐이다. 새 백업 하나가 한도를 넘거나 디스크가 부족하면 실패 이유를 알리고 공개를 대기한다. 사용자가 명시적으로 건너뛰기 전에는 진행하지 않는다. 복원은 월드를 닫은 상태에서 수행하고 원본을 덮어쓰기 전 별도 보존한다.
 
-기본 정책:
+백업은 원상 복구 수단이며 실시간 그리핑 방지를 보장하지 않는다. 방 닫기는 참가자·Relay 연결과 전용 리스너만 정리하고, 호스트는 같은 월드에서 싱글플레이를 계속할 수 있어야 한다.
 
-- 인증된 사용자만 Room 생성
-- Minecraft 계정 하나당 동시 공개방 1개
-- Room 생성 Rate Limit
-- 반복 생성 탐지
-- 신고 및 Abuse History 반영
+## 6. 참가 흐름과 정원
 
-예:
+~~~text
+지원 조합 확인 → 서비스 인증 확인 → 참가 요청
+→ 정책 검사 + 자리 예약 + 티켓 발급
+→ Relay 연결 및 티켓 소비
+→ Host에 승인된 세션 연결
+→ 게임 로그인 신원 비교 → 입장 완료
+~~~
 
-```text
-POST /rooms
+정원 규칙:
 
-계정 기준:
-3회 / 10분
+~~~text
+호스트 1명 + 원격 참가자 점유 슬롯 + 미소비 예약 슬롯 ≤ maxPlayers
+~~~
 
-IP 기준:
-보다 느슨한 제한 적용
-```
+티켓 소비 시 예약 슬롯을 연결 중 슬롯으로 전환한다. 연결 중 슬롯은 입장 완료 전에도 정원을 차지한다. UI의 현재 인원은 실제 입장 완료 인원에 호스트를 더한 값이며, 예약 수는 별도 표시한다.
 
-Rate Limit은 단순 IP 기준이 아니라 다음 값을 조합한다.
+- 티켓 발급 시 원자적으로 자리를 예약한다.
+- 같은 사용자·방에는 동시에 하나의 예약 또는 연결만 허용한다.
+- 티켓은 발급 후 30초 이내 소비해야 한다.
+- 소비 후 30초 이내 게임 입장을 완료해야 한다.
+- 취소·실패·연결 종료 시 슬롯을 반환한다. 중복 종료 통지도 한 번만 반영한다.
+- 응답 유실 후에는 기존 admissionId 상태를 확인한다. 소비된 티켓으로 새 연결을 만들지 않는다.
+- 재접속은 새 참가 승인을 받는다. 0.1에는 세션 이어 붙이기가 없다.
 
-```text
-Account
-Session
-IP / IP Prefix
-```
+Backend가 마지막 자리를 예약한 직후 종료·밴·참가 중지 정책이 바뀌면 소비 단계에서 다시 확인한다. Host도 게임 입장 직전에 최신 로컬 밴과 방 상태를 확인한다.
 
-학교, 회사, 군부대, PC방, CGNAT 환경에서 여러 사용자가 하나의 공인 IP를 사용할 수 있기 때문이다.
+## 7. 네트워크 기본 정책
 
----
+0.1과 후속 비공개방 모두 서비스가 관리하는 게임 연결은 Relay Only다. 직접 P2P, 포트포워딩, UPnP, NAT-PMP, STUN/ICE 후보 교환, NAT hole punching을 사용하지 않는다. Relay 연결 실패를 직접 연결로 우회하지 않는다.
 
-# 17. Room Abuse Detection
+초기 전송 기본안은 검증된 라이브러리의 TLS 1.3 위 TCP 스트림이다. TLS 1.3은 표준을 따른다. 자체 암호 알고리즘을 만들지 않는다. [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446)
 
-내부적으로 사용자 및 Room 활동을 분석할 수 있다.
+- Host와 Player가 모두 Relay에 outbound로 연결한다.
+- Host 제어 연결과 참가자별 데이터 연결을 분리한다.
+- Relay의 참가 승인 뒤 Host가 세션별 outbound 데이터 연결을 연다.
+- 데이터 연결 한 개는 게임 세션 한 개에만 대응한다. 참가자 간 데이터 혼합을 금지한다.
+- 인증서와 서비스 이름을 검증한다. 서비스 내부 Relay–Backend 통신에도 상호 인증을 적용한다.
+- 각 방향에 제한된 버퍼와 역압력을 둔다. 느린 수신자 때문에 메모리를 계속 늘리지 않는다.
+- QUIC, 다중 스트림, UDP fallback은 실측 필요성이 확인된 이후 검토한다.
 
-예:
+일반 HTTPS 프록시가 자체 TCP 터널을 허용한다고 가정하지 않는다. 지원 네트워크 범위와 연결 실패 안내를 실제 환경에서 확인한다.
 
-```text
-Room 생성 빈도
-Room 평균 유지시간
-신고 횟수
-실제 접속자 수
-동일 제목 반복
-비정상적인 Join 실패율
-```
+## 8. IP 보호와 신뢰 범위
 
-내부 상태 예:
+보장 목표:
 
-```text
-NORMAL
-SUSPICIOUS
-RESTRICTED
-BANNED
-```
+> 서비스가 관리하는 API와 게임 연결 경로에서는 상대 플레이어에게 실제 공인·사설 IP와 로컬 게임 포트를 전달하지 않는다. Relay 운영 인프라는 접속을 위해 양쪽 IP를 처리한다.
 
-사용자에게 공개적인 점수로 표시할 필요는 없다.
+공개 API·게임 전달 메타데이터·상대방에게 제공하는 오류 메시지에는 실제 IP를 넣지 않는다. 원본 IP 전달용 프록시 헤더를 게임 서버나 상대 사용자에게 전파하지 않는다.
 
----
+0.1 암호화 보장은 Host–Relay, Player–Relay의 **구간 암호화**다. Relay에 대한 종단간 기밀성은 보장하지 않는다. 원래 Minecraft가 제공하는 암호화는 유지하지만, 모든 상황에서 게임 내용이 Relay로부터 숨겨진다고 홍보하지 않는다. 서비스 차원의 종단간 암호화는 별도 설계·검증 대상이다.
 
-# 18. DDoS 방어 구조
+외부 리소스팩 다운로드, 음성 채팅, 다른 모드의 직접 통신, 사용자가 공유한 링크는 이 보장의 범위 밖이다. 0.1에서는 호스트가 지시하는 외부 리소스팩 URL의 자동 다운로드를 비활성화하고, 별도 네트워크 모드는 공식 지원하지 않는다. 이 제한과 계정 인증 공급자 통신은 문서·설치 안내에 명시한다.
 
-Control Plane과 Data Plane을 분리한다.
+호스트 PC나 Relay 자체가 침해된 경우, 악성 호스트의 월드 동작, 사용자가 직접 공개한 정보까지 보호한다고 주장하지 않는다.
 
-## Control Plane
+## 9. 데이터 모델과 기준 데이터
 
-```text
-Authentication
-Room API
-Search
-Join Ticket
-Moderation
-```
+| 객체 | 핵심 필드 | 기준 데이터 |
+| --- | --- | --- |
+| User | internalUserId, verifiedMinecraftUuid, displayName, status | PostgreSQL, UUID는 검증 결과로만 생성 |
+| WorldProfile | profileId, ownerId, displayName, createdAt | PostgreSQL, 로컬 월드 경로는 저장하지 않음 |
+| WorldBan | profileId, playerUuid, expiresAt, reason, actor | PostgreSQL + Host의 로컬 사본 |
+| Room | roomId, profileId, hostId, serviceEpoch, generation, revision, status, acceptingJoins, maxPlayers, compatibility, listing, accessPolicy, assignedRelayId | PostgreSQL |
+| Admission | admissionId, roomId, generation, playerId, serviceSessionId, tokenHash, state, deadlines | PostgreSQL |
+| Session | sessionId, admissionId, relayId, state, lastConfirmedAt | 소켓 존재는 Relay, 승인과 슬롯은 PostgreSQL |
+| Presence | hostLastSeen, relayLastSeen, gameReady, counts | Redis 파생 캐시, Relay·Host 보고로 갱신 |
+| Report / Audit | actor, subject, action, result, timestamps | PostgreSQL, 보존기간 적용 |
 
-## Data Plane
+게임 인원 보고는 Host가 제공한 값임을 표시하고, Relay 승인 세션 수와 차이가 나면 관찰한다. Relay는 Host PC의 실제 tick이나 게임 인원을 독립적으로 보증하지 않는다.
 
-```text
-Minecraft Relay
-```
+Redis는 목록 캐시·presence·속도 제한을 담당하며 티켓 소비와 정원 승인의 유일한 기준으로 사용하지 않는다. Redis 소실을 이유로 이미 소비된 티켓을 되살리지 않는다. PostgreSQL 상태가 불확실하면 신규 승인을 중지한다.
 
-구조:
+계정당 진행 중인 Room 1개, 방·사용자당 열린 Admission 1개를 저장소 제약으로 보장한다. 방 세대와 슬롯의 변경은 같은 방에 대한 트랜잭션으로 직렬화한다. 프로필 Ban 변경도 해당 방의 승인 트랜잭션과 같은 정책 revision을 기준으로 조정한다. DB와 Relay 사이의 작업은 재시도 가능한 명령·확인 응답과 조정 작업으로 수렴시킨다.
 
-```text
-                    CDN / WAF
-                        │
-                   API Gateway
-                        │
-        ┌───────────────┼───────────────┐
-        │               │               │
-       Auth            Room           Abuse
-        │               │               │
-        └───────────────┼───────────────┘
-                       DB
-                      Redis
+serviceEpoch는 재해 복구 시 서비스 전체 승인 세대를 구분한다. 모든 임시 참가·Host 권한과 Control 승인은 serviceEpoch와 Room generation에 결합한다. 일반 API 재시작은 epoch를 바꾸지 않으며 DB 복원 시에는 34절의 폐기 절차를 적용한다.
 
+## 10. Public API 데이터 분리
 
-────────────────────────────────────
+공개 DTO를 명시적으로 정의한다. DB 객체 전체 직렬화는 사용하지 않는다.
 
-Host
- │
- ▼
+공개 Room 정보:
 
-Relay Cluster
+~~~text
+roomId, roomName, description, hostDisplayName
+playerCount, maxPlayers, acceptingJoins
+minecraftVersion, loader, publicRoomProtocolVersion
+relayRegion, listing, accessPolicy
+hostRelayRttMs, measuredAt
+~~~
 
- ▲
- │
-Player
-```
+Client–Relay RTT는 조회하는 사용자의 로컬 측정값이다. Backend가 모든 사용자에게 같은 ping 값을 반환하지 않는다.
 
-Relay가 공격당하더라도 인증이나 Room 검색 등의 Control Plane 서비스가 같이 중단되지 않도록 한다.
+내부 사용자 ID, profileId, 실제 IP, 로컬 포트, assignedRelayId, 토큰, 이메일, 제재 내부 사유는 공개 DTO에서 제외한다. Join 응답은 해당 참가자에게 필요한 roomId, admissionId, relayEndpoint, joinTicket, expiresAt만 제공한다. 티켓은 URL query에 넣지 않는다.
 
----
+비공개방은 목록뿐 아니라 상세 조회와 코드 조회에서도 접근 정책을 검사한다. 방 이름·설명은 길이를 제한하고 제어문자와 화면 렌더링 처리를 검증한다.
 
-# 19. Origin 보호
+## 11. Room 생명주기와 Lease
 
-Control Backend의 실제 서버 IP를 직접 노출하지 않는다.
+~~~text
+CREATING → ACTIVE → CLOSING → CLOSED
+    └→ EXPIRED
+ACTIVE → UNHEALTHY → ACTIVE 또는 EXPIRED
+~~~
 
-```text
-Internet
-   ↓
-CDN / WAF
-   ↓
-Load Balancer / API Gateway
-   ↓
-Backend
-```
+CLOSED와 EXPIRED는 최종 상태이며 같은 roomId로 재활성화하지 않는다. CREATING 60초 초과는 EXPIRED다. 목록에는 ACTIVE이면서 신규 참가를 받는 방만 기본 노출한다. 가득 찬 방은 인원과 함께 표시하되 참가를 비활성화한다.
 
-Backend Origin은 가능한 경우 CDN 또는 Load Balancer에서 오는 연결만 허용한다.
+호스트의 정상 종료 요청은 CREATING·ACTIVE·UNHEALTHY에서 CLOSING으로 전환할 수 있다. 준비가 끝나기 전의 취소도 같은 정리 절차를 따른다. UNHEALTHY에서 ACTIVE로 복구하려면 신호뿐 아니라 게임 수신 준비·현재 세대·정책·실제 세션 조정이 모두 완료되어야 한다.
 
----
+| 신호 | 초기 정책 | 효과 |
+| --- | --- | --- |
+| Host·Relay heartbeat | 5초 간격, 소량 jitter | Backend 수신 시각으로 관찰 |
+| 필요한 신호가 15초 이상 오래됨 | UNHEALTHY | 목록에서 제외, 신규 참가 중지 |
+| Control 승인 갱신 | 정상 시 10초 간격 | 현재 세대·정책·활성 세션을 재확인 |
+| 마지막 Control 승인 후 120초 | 기존 세션 유예 만료 | Relay가 세션을 종료하고 Host를 단독 플레이로 전환 |
+| 개별 Host 데이터 연결 단절 | 즉시 해당 세션 종료 | 다른 참가자 세션과 Room은 유지 가능 |
+| Host 전체 단절 확정 후 30초 경과 | EXPIRED | 슬롯과 임시 상태 정리 |
 
-# 20. Relay Pool
+목록 Lease 만료는 기존 게임의 즉시 종료와 다르다. Backend와만 통신이 끊겼다면 기존 게임은 최대 120초의 승인 유효기간 안에서 유지할 수 있다. 장애 복구 후 실제 연결과 정책을 대조하기 전에는 ACTIVE로 되돌리지 않는다.
 
-Relay를 단일 서버로 구성하지 않는다.
+Host 전체 단절은 Relay가 Host 제어 연결과 게임 수신 불가를 확인한 경우다. Backend heartbeat 누락만으로 Host Crash를 확정하지 않는다. 마지막 Control 승인 만료로 기존 연결을 모두 닫은 방은 EXPIRED로 정리하고 새 Room으로 재개설한다. CLOSING 상태도 종료 확인 또는 승인 유예 만료 후 CLOSED로 정리해 계정의 방 슬롯을 영구 점유하지 않게 한다.
 
-예:
+같은 Relay·Host 제어 인스턴스가 유효한 승인 기간 안에 복구하면 세션 목록을 조정한 뒤 동일 generation을 유지할 수 있다. Relay 재배정·프로세스 재시작·소유권 불확실성은 generation을 증가시키고 이전 세대의 참가권을 무효화한다. 이전 Relay의 종료 확인 또는 이전 승인의 만료 전에는 새 세대를 활성화하지 않는다.
 
-```text
-KR
-├─ KR-01
-├─ KR-02
-├─ KR-03
-└─ KR-04
+클라이언트 시각이나 Redis TTL만으로 소유권을 판정하지 않는다. 만료는 Backend 기준으로 판정하며 노드 간 시계 오차를 관찰한다. Relay의 로컬 유예 타이머에는 단조 시계를 사용한다. 소유권이 불명확하면 신규 입장을 중지한다.
 
-JP
-├─ JP-01
-└─ JP-02
+## 12. 사용자 인증과 게임 신원 연결
 
-SG
-└─ SG-01
-```
+Minecraft UUID는 식별값이며 인증 증거가 아니다. 서비스가 검증한 계정 소유 결과만 User에 연결한다. 사용자 입력 UUID·닉네임·로컬 파일만으로 세션을 발급하지 않는다. 표시명 변경은 계정·밴의 식별 기준에 영향을 주지 않는다.
 
-Room 생성 시 적절한 Relay를 할당한다.
+인증 계약:
 
-```text
-Room A → KR-02
-Room B → KR-04
-Room C → KR-01
-```
+1. Backend가 만료시간과 사용 목적이 있는 일회성 challenge를 발급한다.
+2. Client가 정식 Minecraft 계정 세션을 이용해 소유 증명을 수행한다.
+3. Backend의 Auth adapter가 공급자 측 검증 결과와 challenge의 대상·만료·일회성을 확인한다.
+4. 검증된 UUID에 서비스 세션을 발급한다.
+5. Join Ticket을 서비스 세션과 UUID에 결합한다.
+6. Relay가 승인된 UUID·sessionId·generation을 인증된 내부 경로로 Host에 전달한다.
+7. Host는 게임 로그인에서 검증된 UUID와 승인 UUID를 비교한 뒤에만 입장을 완료한다.
 
-향후 Relay 배정 기준:
+기본 검토안은 기존 정식 런처 세션을 이용한 공급자 검증이다. 구체적인 지원 API·라이브러리·호출 순서·IP 비공개 조건과의 양립은 ADR-001에서 Phase 0에 검증한다. 불가능하면 지원되는 브라우저 인증 흐름과 비교해 확정한다. 자체 소유 증명 암호 프로토콜을 만들거나 검증 실패를 offline 신원 신뢰로 우회하지 않는다.
 
-- Host Latency
-- Client 예상 Latency
-- Relay CPU 부하
-- Relay Memory
-- Network Bandwidth
-- 지역
-- 장애 여부
+Microsoft/Minecraft 비밀번호나 런처의 원본 access/refresh token을 서비스 Backend·Relay·Host에 전송하지 않는 것을 기본 조건으로 한다. API 가능 여부가 확인되지 않은 상태에서 인증 연동을 완성했다고 표시하지 않는다.
 
----
+0.1 서비스 access session은 15분, 갱신 세션은 최대 24시간을 초기값으로 한다. 갱신 자격은 회전시키고 재사용이 발견되면 해당 갱신 계열을 폐기한다. 클라이언트의 갱신 자격은 OS 보호 저장소에 저장하며 사용할 수 없으면 메모리에만 보관한다. 로그아웃·계정 정지는 신규 발급을 차단하고 연결 철회를 전파한다.
 
-# 21. Relay 자원 제한
+정상 갱신은 serviceSessionId를 유지하고 자격만 회전시킨다. access 자격 만료는 신규 API 요청을 막지만 이미 ACTIVE인 게임의 즉시 종료와 같지 않다. 게임 연결은 별도 Control 승인을 갱신하며, 갱신 세션의 최대 수명 전에 재인증해야 한다. 최대 수명 경과·로그아웃·정지는 연결 철회 사유다.
 
-Room 하나가 Relay의 자원을 무제한 소비할 수 없게 한다.
+인증 공급자 장애 시 새 계정 증명은 중지한다. 이미 검증되어 유효한 서비스 세션은 정책이 허용하는 범위에서 사용할 수 있지만 만료된 증명을 연장하지 않는다. 게임 로그인에 공급자 확인이 필요한 경우 실패를 사용자에게 안내한다.
 
-Room 및 Connection 기준 제한:
+## 13. Join Ticket과 원자적 참가 승인
 
-```text
-최대 동시 연결
-최대 Handshake 수
-초당 신규 Connection
-최대 Packet 크기
-최대 Bandwidth
-Idle Timeout
-Handshake Timeout
-```
+0.1은 **불투명한 난수 티켓 + Backend 조회 검증**을 사용한다. 티켓 안에 개인정보나 서명된 Room 정보를 담는 형식은 초기 범위에서 제외한다. 저장소에는 티켓 원문 대신 해시와 아래 승인 정보를 둔다.
 
-예:
+~~~text
+admissionId, roomId, serviceEpoch, generation, playerId, serviceSessionId
+assignedRelayId, reservedSlot, expiresAt, state
+~~~
 
-```text
-Room Max Players = 8
+- 유효시간 30초. 추측하기 어려운 암호학적 난수로 생성한다.
+- 상태는 RESERVED → CONNECTING → ACTIVE → RELEASED이며, 예약 만료·취소도 최종 상태다.
+- 티켓은 인증된 서비스 세션과 함께 Relay에 제시한다. Relay는 Backend에 내부 인증으로 소비를 요청한다.
+- Backend는 방 상태·세대·서비스 세션·밴·Relay 배정·만료·정원을 같은 승인 트랜잭션 안에서 재검사한다.
+- 동일 티켓에 대한 동시 소비는 하나의 connectionAttemptId만 성공한다.
+- 내부 호출의 응답 유실은 같은 Relay·같은 connectionAttemptId에 한해 동일 결과로 재확인한다. 새 소켓이나 다른 시도에 승인 결과를 재사용하지 않는다.
+- DB·정책 검증을 할 수 없으면 신규 소비를 거절한다. 단순 캐시 조회로 승인하지 않는다.
+- 입장 완료 확인에도 Admission과 Host·Relay의 세션 식별자를 일치시킨다.
 
-Active Sessions = 8
-Pending Handshakes = 최대 4
-```
+티켓 원문을 저장하지 않으므로 발급 응답이 유실되면 같은 멱등 키의 재요청에는 기존 admissionId·상태와 REISSUE_REQUIRED를 반환한다. 클라이언트는 기존 예약을 취소하고 새 키로 발급받는다. 재요청마다 새 티켓이나 슬롯을 자동 생성하지 않는다.
 
-공격자가 수천 개의 Connection을 생성해도 Host의 Minecraft 서버까지 그대로 전달하지 않는다.
+Host가 게임 신원 일치를 확인하고 Backend가 ACTIVE 전환을 승인하기 전에는 플레이를 허용하지 않는다. 입장 도중 Backend가 중단되면 해당 시도를 닫고 슬롯을 정리한다. 이미 ACTIVE인 세션에만 11절의 장애 유예가 적용된다.
 
----
+## 14. Host Tunnel Token과 Relay 등록
 
-# 22. Minecraft 프로토콜 보호
+Host Tunnel Token도 30초 유효한 일회성 불투명 토큰이다. Backend가 ownerId, roomId, serviceEpoch, generation, assignedRelayId, role=HOST_CONTROL에 결합한다. 참가자 티켓으로 호스트 역할을 얻을 수 없다. 발급 응답 유실 시 기존 미소비 토큰을 폐기하고 같은 Room에 새 토큰을 발급하는 소유자 전용 복구 경로를 제공한다.
 
-Relay는 Minecraft 프로토콜을 지나치게 많이 이해하지 않는 구조를 우선한다.
+Relay가 소유권을 확인한 뒤 제어 연결을 등록한다. 등록 이후에는 승인 갱신과 연결에 결합된 세션 자격을 사용하며 초기 토큰을 반복 사용하지 않는다. 참가자별 Host 데이터 연결에는 해당 sessionId와 generation에 한정된 단기 연결 권한을 발급한다.
 
-기본 역할:
+토큰 만료는 이미 승인된 연결을 즉시 종료한다는 뜻이 아니다. 실제 연결의 수명은 Control 승인과 방·세션 상태로 관리한다. Host 재연결은 새 토큰을 요구하고, 다른 Relay로 바뀌면 세대 전환 절차를 수행한다.
 
-```text
-Encrypted Stream Relay
-```
+Relay 내부 인증서·자격 회전, 운영자 접근권한, 폐기 절차를 배포 문서에 포함한다.
 
-검사 항목:
+## 15. 방 종료와 철회
 
-- Frame Size
-- Connection State
-- Timeout
-- Bandwidth
-- 비정상 Connection Pattern
+정상 종료:
 
-Minecraft 프로토콜 전체를 Relay가 해석하도록 만들면 버전 호환성과 보안 유지 비용이 크게 증가한다.
+~~~text
+CLOSING 확정 → 신규 예약·소비 차단 → 미완료 Admission 취소
+→ Relay·Host에 종료 명령 → 참가 세션·리스너 종료
+→ 슬롯 반환 → CLOSED 확정 → 호스트 싱글플레이 유지
+~~~
 
----
+종료와 밴은 요청 수신만으로 완료라고 표시하지 않는다. 적용 확인을 받으면 완료, 미응답이면 적용 대기와 남은 유예시간을 표시한다. 정상 네트워크에서 철회 반영 목표는 5초 이내다. 네트워크 분리 중 원격 Relay에 도달하지 못한 철회는 마지막 승인 후 최대 120초까지 지연될 수 있다.
 
-# 23. Host Connection Guard
+호스트의 로컬 방 닫기·킥·밴은 Backend 장애 중에도 즉시 게임 연결에 적용한다. Backend에 전달하지 못한 변경은 로컬에 저장하고 복구 후 동기화하기 전 신규 참가를 재개하지 않는다.
 
-Relay를 통과한 트래픽도 Integrated Server 앞에서 추가적으로 검증할 수 있다.
+종료 작업은 반복 호출해도 같은 결과를 내며, 지연 도착한 heartbeat·입장 확인이 최종 상태를 되살릴 수 없다. 종료된 방의 티켓·연결 권한은 영구히 무효이며 운영 통계 보존과 권한 유효기간을 구분한다.
 
-```text
-Player
- ↓
-Relay
- ↓
-Connection Guard
- ↓
-Minecraft Integrated Server
-```
+## 16. 공개방 Spam 방지
 
-검증 대상:
+초기 제한:
 
-- 비정상 Packet
-- Packet Spam
-- Oversized Payload
-- Invalid Handshake
-- 비정상 State Transition
-- Custom Payload 크기
+| 대상 | 정책 |
+| --- | --- |
+| 계정의 진행 중 Room | CREATING·ACTIVE·UNHEALTHY·CLOSING 합계 1개 |
+| Room 생성 | 계정당 10분에 새 작업 3개 |
+| Join 시도 | 계정당 분당 10회, 짧은 burst 최대 3회 |
+| 목록 조회 | 인증 세션당 분당 30회, 페이지 최대 50개 항목 |
+| IP·IP prefix | 계정 제한을 보완하는 집계 신호, 공유망 오탐을 측정해 별도 설정 |
 
----
+같은 멱등 키의 재전송은 새 생성 작업으로 세지 않되 전체 요청량 제한은 적용한다. 계정·세션·IP를 함께 사용하며 학교·PC방·CGNAT 공유 주소만으로 영구 제재하지 않는다. 제한 응답에는 재시도 시점을 제공하고 클라이언트는 지수 backoff와 jitter를 사용한다.
 
-# 24. PublicRoom 자체 Protocol
+Redis 속도 제한 상태가 소실되면 신규 생성·참가를 일시 중지하고 보수적 제한 상태를 초기화한다. 정상 제한이 복구되기 전 무제한 요청을 허용하지 않는다.
 
-Custom Payload는 별도 Namespace를 사용한다.
+## 17. Abuse Detection
 
-예:
+초기에는 생성 빈도, 실제 연결 대비 실패 비율, 전송량, 반복 신고를 관찰한다. 자동 점수만으로 영구 정지하지 않는다.
 
-```text
-publicroom:hello
-publicroom:capabilities
-publicroom:session
-publicroom:status
-```
+NORMAL, SUSPICIOUS, RESTRICTED, BANNED는 내부 상태다. 제한에는 근거 코드·적용 범위·만료·검토자를 기록한다. 신고 수는 사실 확인과 구분하고 중복 신고를 합친다. 사용자에게 적용된 제한과 이의 제기 방법을 안내한다.
 
-모든 Packet Handler에서 다음 검증을 수행한다.
+0.1은 기본 제한과 수동 검토, 고급 점수화·추천 반영은 1.0 이후다.
 
-```text
-Length Check
-Range Check
-Type Check
-Permission Check
-State Check
-```
+## 18. DDoS 방어 구조
 
-Client가 전달하는 값은 신뢰하지 않는다.
+Control Plane은 HTTPS API용 CDN/WAF와 API 제한을 사용한다. Data Plane은 TCP Relay를 보호하는 별도의 L3/L4 방어와 공급자 측 대역폭 대응을 필요로 한다. HTTP 계층 방어만으로 게임 Relay가 보호된다고 가정하지 않는다. [계층별 보호 구분 참고](https://developers.cloudflare.com/spectrum/about/ddos-for-spectrum/)
 
----
+Relay 연결·버퍼·대역폭 상한은 21절을 따른다. 이러한 제한이 모든 악성 게임 입력이나 대규모 회선 포화를 차단한다고 보장하지 않는다.
 
-# 25. 방 검색
+공개 알파 전 배포 공급자의 지원 프로토콜, 보호 범위, 전송량 과금, 회선 상한, 비상 차단 방법을 ADR-005에 기록한다. 공격성 부하 검증은 외부 서비스가 아닌 격리된 자체 시험 환경에서 수행한다.
 
-MVP 검색 기능:
+## 19. Origin과 운영 경로 보호
 
-- 방 이름
-- Host 이름
-- 태그
+Backend는 허용한 CDN·Load Balancer 경로만 수신하고 내부 API는 인증된 Relay·운영 도구만 호출한다. 외부에서 임의로 준 전달 IP 헤더를 신뢰하지 않는다.
 
-필터:
+Relay가 L4 프록시 뒤에 있다면 원본 서버 접근도 해당 프록시 경로로 제한한다. 프록시가 전달하는 접속 IP는 Relay 운영 제한에만 사용하고 Host 게임 연결로 전달하지 않는다.
 
-- Minecraft 버전
-- 게임 모드
-- 인원수
-- 지역
-- 비밀번호 여부
+관리자 기능은 일반 사용자 API 권한과 분리한다. 관리자 로그인, 역할 구분, 민감 작업 감사 기록, 자격 폐기는 공개 알파의 필수 조건이다.
 
-정렬:
+## 20. Relay Pool과 환경별 규모
 
-- 최근 생성
-- 플레이어 수
-- Ping
+| 환경 | 구성 | 장애 기대 동작 |
+| --- | --- | --- |
+| Phase 0 비공개 실험 | 단일 Relay 허용 | 중단 후 수동 재연결 |
+| 0.1 제한 공개 알파 | 한 지역, 단일 Relay 허용, 수용량 제한 | 서비스 중단 안내, 복구 후 새 승인으로 재접속 |
+| 확장 시험 | 한 지역 내 복수 Relay | 신규 배정 제외·drain·재배정 검증 |
+| 1.0 운영 | 복수 Relay와 다중 지역 | 부하 배정·장애 도메인 분리·지역 운영 |
 
-향후 추가:
+0.1에서 고가용성을 약속하지 않는다. 단일 Relay 운영 중에는 무중단 배포와 장애 시 자동 세션 유지도 약속하지 않는다.
 
-- 즐겨찾기
-- 최근 참가
-- 친구가 참가한 방
-- 추천
+배정은 건강 상태, 여유 대역폭, 세션·메모리 상한과 호스트 RTT를 우선한다. 방 생성 시 미래 참가자의 정확한 지연은 알 수 없으므로 추정값임을 명시한다. 종료 준비 중인 Relay는 새 Room을 받지 않는다.
 
----
+## 21. Relay 자원 제한과 비용
 
-# 26. Ping 표시
+초기 방 정원 8명은 호스트 1명 + 원격 세션 최대 7개다. 연결 중·예약 중 슬롯도 이 한도에 포함한다. 동시에 CONNECTING인 세션은 방당 최대 4개이며, 정원 여유보다 많을 수 없다.
 
-Host IP를 직접 Ping하지 않는다.
+초기 시험 제한:
 
-Client와 Relay 사이의 Latency를 측정한다.
+| 항목 | 기준 |
+| --- | --- |
+| TLS·제어 핸드셰이크 | 단계당 10초 |
+| 게임 입장 완료 | 티켓 소비 후 30초 |
+| 터널 제어 프레임 | 최대 16KiB |
+| 터널 데이터 프레임 | 최대 64KiB, 게임 스트림을 나누어 전송 |
+| 대기 송신 버퍼 | 세션·방향당 최대 1MiB |
+| 전송률 | 방향당 평균 1MiB/s, burst 4MiB를 초기 시험값으로 사용 |
+| 터널 생존 확인 | 10초 간격, 30초 응답 없음 시 연결 종료 |
 
-```text
-Client
-↓
-KR Relay
-22 ms
-```
+게임 패킷이 64KiB보다 크다는 이유만으로 차단하지 않는다. 위 프레임 크기는 자체 터널 단위다. 역압력과 지연 상한을 적용하고 정상 청크 로딩을 시험한 뒤 전송률 값을 조정한다.
 
-Host 또한 Relay 기준 Latency를 측정한다.
+Relay별 최대 세션 수는 CPU·메모리·파일 디스크립터·측정 대역폭 중 가장 먼저 한계에 도달하는 값을 기준으로 산정한다. 메모리 계산에는 방향별 큐뿐 아니라 TLS·소켓 버퍼와 제어 연결도 포함한다.
 
-```text
-Host
-↓
-KR Relay
-14 ms
-```
+비용 모델:
 
-이를 기반으로 연결 품질을 추정한다.
+~~~text
+플레이어 시간 = 원격 참가자별 접속 시간의 합
+중계 egress = Relay→Host 바이트 + Relay→Player 바이트 + 제어 오버헤드
+예상 월 비용 = 서버 고정비 + 공급자 과금 대상 전송량 × 단가
+             + DDoS 보호 + DB·캐시 + 로그·모니터링 비용
+~~~
 
-표시 방법:
+각 방향 egress 합이 플레이어당 평균 100kB/s라면 플레이어 시간당 약 0.36GB다. 이는 예시이며 Minecraft의 실제 전송량 추정치가 아니다. 공급자별 ingress·지역 간 전송·초과 과금도 견적에 반영한다.
 
-```text
-22 ms
-```
+공개 알파 전 월 예산·단가·부하 측정 결과를 ADR-005에 채워야 한다. 월 예상 비용이 예산의 70%이면 경보, 85%이면 신규 방 제한, 95%이면 신규 참가 제한을 초기 정책으로 한다. 이미 연결된 사용자의 강제 종료는 별도의 비상 운영 결정과 안내를 거친다. 네트워크·메모리 안전 상한은 비용 정책과 관계없이 즉시 적용한다.
 
-또는
+## 22. Relay와 게임 프로토콜의 책임
 
-```text
-좋음
-보통
-나쁨
-```
+Relay는 터널 헤더·프레임 길이·역할·세션 상태·시간 제한·바이트 수만 검사한다. 암호화되거나 압축된 Minecraft 내용 전체를 해석하지 않는다.
 
----
+게임 패킷의 상태 전이, Minecraft 압축 해제 크기, Custom Payload의 유효성은 Minecraft 처리 경계와 Host Guard에서 검증한다. 다른 버전의 게임 파서를 Relay에 함께 넣어 호환성을 해결하지 않는다.
 
-# 27. 친구 및 비공개 방
+인증된 사용자도 비정상 입력을 보낼 수 있으므로, Relay 인증 성공을 게임 입력 신뢰로 취급하지 않는다.
 
-후속 버전에서 Social 기능을 추가한다.
+## 23. Host Connection Guard
 
-지원 가능한 Visibility:
+Host Guard는 게임 로그인 전에 승인 메타데이터를 연결과 결합하고, 실제 로그인 UUID·room generation·권한·로컬 밴을 확인한다. UUID를 클라이언트가 보낸 임의 Custom Payload만으로 확정하지 않는다.
 
-```text
-PUBLIC
-UNLISTED
-FRIENDS
-INVITE_ONLY
-PASSWORD
-```
+- 로그인·설정·플레이 단계의 허용 동작을 구분한다.
+- 패킷·압축 해제 크기와 Custom Payload 상한은 대상 Minecraft 버전의 처리 경계에서 검증한다.
+- 상태 변경은 올바른 게임 스레드에서 수행한다.
+- 세션별 작업량·대기열을 제한하고 한 참가자가 전체 호스트를 막지 않게 한다.
+- 정책 위반 시 해당 연결을 종료하고 민감정보 없는 사유 코드만 기록한다.
 
-## PUBLIC
+자체 Guard가 모든 Minecraft 취약점이나 악성 모드를 방어한다고 주장하지 않는다. 지원 버전의 업데이트 정책과 검증된 제한값이 함께 필요하다.
 
-공개 목록에 노출된다.
+## 24. PublicRoom 프로토콜 계약
 
-## UNLISTED
+프로토콜을 게임 내 Custom Payload와 외부 터널 제어 프로토콜로 분리한다.
 
-검색 목록에는 표시되지 않고 Room Code를 통해서만 참가한다.
+- 터널 제어: Host 등록, 참가 승인, 데이터 연결 결합, 생존 확인, 종료.
+- 게임 payload: publicroom:hello, publicroom:capabilities, publicroom:status.
+- 계정의 원본 인증 자격과 서비스 refresh token은 게임 payload에 싣지 않는다.
+- 모든 메시지에 명시적인 버전·타입·길이 제한을 둔다.
+- 역할·길이·범위·상태·권한을 검증하고 알 수 없는 필수 기능은 접속 전에 거절한다.
+- 호환성 협상 실패를 기본 권한으로 처리하지 않는다.
 
-## FRIENDS
+protocol/에는 스키마, 상태 전이, 오류 코드, 길이 상한, 단위, 타임아웃, 요청 중복 처리 규칙과 Java/API/Relay 공통 계약 fixture를 둔다. API 버전, 터널 버전, 모드 릴리스 버전은 서로 구분한다.
 
-Host의 친구만 참가할 수 있다.
+## 25. 방 목록과 검색
 
-## INVITE_ONLY
+0.1은 PUBLIC + OPEN 방의 페이지 단위 목록·새로고침·상세 조회를 제공한다. 기본 순서는 생성 시각과 roomId를 결합한 안정적인 순서이며 cursor로 페이지를 이동한다. 목록 캐시의 오래된 결과만으로 참가를 승인하지 않는다.
 
-Host의 초대 또는 승인이 필요하다.
+0.2에서 방 이름·호스트 표시명·태그 검색과 Minecraft 버전·게임 모드·여유 인원·지역·입장 조건 필터를 추가한다. 정렬 옵션은 최근 생성, 인원, 로컬에서 추정한 지연이다. 사용자별 RTT를 모르는 Backend가 전체 방의 ping 순서를 정확히 정렬한다고 가정하지 않는다.
 
-## PASSWORD
+검색 문자열과 태그 수·길이, 페이지 크기를 제한한다. 친구 방 추천·개인화 추천은 별도 후속 범위다. 기능의 출시 버전은 39~43절을 기준으로 한다.
 
-비밀번호를 알아야 참가할 수 있다.
+## 26. Ping과 연결 품질 표시
 
----
+호스트의 실제 IP를 대상으로 측정하지 않는다. RTT는 왕복 지연을 뜻하며 단위는 ms다.
 
-# 28. Room Code
+~~~text
+Client–Relay RTT: 22ms
+Host–Relay RTT:   14ms
+경로 RTT 추정:    약 36ms
+~~~
 
-Discord 등의 외부 서비스로 쉽게 공유할 수 있도록 Room Code 기능을 제공한다.
+목록은 “예상 지연 약 36ms”처럼 표시한다. 단순 합은 경로 추정값이며 Relay 대기·게임 처리·네트워크 변동을 모두 설명하지 않는다. 입장 후에는 게임 연결에서 실제 관측한 RTT를 별도로 표시한다.
 
-예:
+호스트 구간 값은 호스트가 보고한 추정치다. 측정 시각과 최신 여부를 같이 관리하고, 30초 이상 오래되거나 어느 한 구간이 없으면 “측정 중” 또는 “알 수 없음”으로 표시한다. 같은 Relay에 대한 측정은 공유하고 모든 방을 개별적으로 반복 측정하지 않는다.
 
-```text
-AB7D-K2MQ
-```
+## 27. 목록 공개 범위와 입장 조건
 
-Room Code는 서버 주소가 아니다.
+서로 독립된 두 필드를 사용한다.
 
-```text
-Room Code
-    ↓
-Backend
-    ↓
-Room 확인
-    ↓
-Join Ticket 발급
-    ↓
-Relay
-```
+| 필드 | 값 | 의미 |
+| --- | --- | --- |
+| listing | PUBLIC / UNLISTED | 공개 목록 노출 여부 |
+| accessPolicy | OPEN / PASSWORD / FRIENDS / INVITE_ONLY | 입장에 필요한 추가 조건 |
+| acceptingJoins | true / false | 호스트가 신규 참가를 받고 있는지 |
 
-Room Code가 외부에 노출되더라도 Host IP는 노출되지 않는다.
+0.1은 PUBLIC + OPEN만 지원한다. OPEN도 계정 인증·정원·밴 검사는 생략하지 않는다. PUBLIC + PASSWORD와 UNLISTED + OPEN은 0.2에 허용한다. FRIENDS·INVITE_ONLY는 0.3이다.
 
----
+UNLISTED는 목록에 없다는 뜻이며 비밀 보관이나 신뢰된 참가자만의 접근을 보장하지 않는다. “초대 전용”은 별도 정책이다. 입장 조건 변경 후 기존 플레이어를 유지할지 내보낼지 UI에서 구분하고, 미완료 Admission은 취소한 뒤 새 정책으로 다시 승인한다.
 
-# 29. 친구 기능
+비밀번호는 단방향 비밀번호 해시로 저장하고 시도 횟수를 제한한다. 비밀번호 원문을 로그·목록·Room Code에 넣지 않는다.
 
-후속 기능:
+## 28. Room Code
 
-- 친구 요청
-- 친구 수락
-- 친구 삭제
-- 친구 목록
-- Online 상태
-- 친구가 플레이 중인 Room
-- 친구 전용 공개방
-- 직접 초대
+0.2에서 사람이 공유할 수 있는 Room Code를 제공한다.
 
----
+~~~text
+AB7D-K2MQ → Backend 조회 → 인증·입장 조건 검사 → Join Ticket → Relay
+~~~
 
-# 30. 신고 및 차단
+코드는 서버 주소나 계정 인증 수단이 아니다. 코드 조회의 추측 시도를 제한하고, 코드만 알아도 PASSWORD·FRIENDS·INVITE_ONLY 조건을 우회할 수 없도록 한다. 방 종료 시 폐기하고 호스트가 회전시킬 수 있게 한다.
 
-사용자 기능:
+코드의 길이·문자 집합은 예상 방 수와 시도 제한을 근거로 결정하며 위 예시는 확정된 보안 파라미터가 아니다. 다른 서비스로 코드를 공유해도 서비스가 실제 IP를 포함시켜서는 안 된다.
 
-- Room 신고
-- Player 신고
-- Player 차단
-- Room 숨기기
+## 29. 친구·초대·Presence
 
-Host 기능:
+0.3 범위는 친구 요청·수락·삭제, 친구 목록, 직접 초대, FRIENDS·INVITE_ONLY, 참가 승인, 사용자 차단이다.
 
-- Kick
-- Temporary Ban
-- Permanent Room Ban
+친구에게 온라인 상태와 현재 방을 공개할지 선택할 수 있어야 한다. 차단은 새 친구 요청·초대와 해당 사용자의 접근 정책에 반영한다. 친구 관계 변경과 초대 만료·철회는 티켓 소비 시 재확인한다.
 
-운영자 기능:
+초대에는 대상 사용자·방·만료시간·사용 횟수 제한을 두고, 초대 링크와 Room Code를 동일 권한으로 취급하지 않는다.
 
-- 신고 목록
-- 사용자 일시 정지
-- 사용자 영구 정지
-- Room 강제 종료
-- Room 생성 권한 제한
-- Relay 사용 제한
+## 30. 신고와 지속적인 Ban
 
----
+0.1에서 Kick, 기간제 Ban, 해제 전까지 유지되는 Ban, Report와 운영자의 수동 제재를 제공한다.
 
-# 31. Minecraft Mod 호환성
+- Kick은 현재 연결을 종료하며 다시 참가할 수 있다. UI에서 재참가를 막으려면 Ban을 선택하도록 구분한다.
+- Ban의 기본 범위는 ownerId가 소유한 WorldProfile과 검증된 Minecraft UUID의 조합이다.
+- 같은 WorldProfile로 Room을 재개설하면 Ban을 유지한다.
+- 로컬 월드를 복제했을 때 같은 프로필을 재사용할지 새 프로필을 만들지 호스트가 선택한다. 원격 사용자가 타인의 프로필을 선택할 수 없다.
+- 다른 WorldProfile로 재개설하면 기존 월드별 Ban은 자동 적용되지 않는다. 계정 전체 차단은 0.3 사용자 차단과 구분한다.
+- 운영자의 서비스 계정 정지는 모든 Room에 적용한다.
+- Host의 로컬 Ban과 Backend Ban을 함께 검사한다. 동기화 대기 중에는 더 제한적인 상태를 유지한다.
 
-초기 버전에서는 지원 범위를 좁힌다.
+신고에는 대상 방·세션·시각·사유와 사용자가 직접 제공한 설명을 받는다. 전체 게임 패킷이나 채팅을 자동 수집하지 않는다. 증거가 부족한 신고는 사실로 확정하지 않으며, 중복·허위 신고 대응과 이의 제기 절차를 운영 도구에 포함한다.
 
-우선 지원:
+운영자 강제 종료·정지는 사유와 적용 확인을 남긴다. 정상 시 5초, 네트워크 분리 시 최대 120초라는 철회 한계는 15절과 동일하다.
 
-```text
-Fabric
-PublicRoom Mod
-Vanilla-compatible environment
-```
+## 31. 지원 범위와 Mod 호환성
 
-추후 Host의 다음 정보를 제공한다.
+0.1 지원 목표:
 
-```text
-Minecraft Version
-Mod Loader
-Loader Version
-Required Mod List
-Mod Hash
-```
+- Minecraft Java Edition의 정확한 릴리스 한 개.
+- Fabric Loader·Fabric API·JDK·Loom의 검증된 고정 조합 한 개.
+- Host와 Player 모두 Open MC Server Mod 설치.
+- 개발·초기 수동 QA 기준은 Windows, Backend·Relay 배포 기준은 Linux.
+- 기본 게임과 필수 의존성만 공식 지원. Bedrock, Forge/NeoForge, 임의 모드팩, 외부 음성 통신은 제외.
 
-접속 전에 호환성 검사 가능:
+정확한 버전 번호는 ADR-003에서 Phase 0 종료 전에 확정한다. 검증하지 않은 최신 버전이나 “1.21.x 전체”를 지원한다고 표시하지 않는다. Fabric의 최신 문서와 선택한 버전의 API가 같다고 가정하지 않는다.
 
-```text
-접속할 수 없습니다.
+0.1에서도 입장 전 Minecraft 릴리스·프로토콜, Loader 지원 조합, PublicRoom 프로토콜을 확인한다. Mod manifest와 실제 설치 정보가 다르면 이유를 안내하고 접속을 중지한다.
 
-필요한 모드:
-- Create
-- Fabric API
-```
+0.4에서 필수 Mod ID·버전·측면 정보와 호환 manifest 비교를 추가한다. 클라이언트 전용 모드까지 포함한 단일 해시 일치만으로 모든 호환성을 판정하지 않는다. 파일 다운로드·자동 설치는 별도 사용자 동의와 공급망 검토가 필요한 후속 기능이다.
 
----
+지원 버전의 보안 업데이트와 의존성 갱신은 0.1부터 관리한다. 새 조합은 회귀 검증 후 추가하며 사용 중인 조합을 예고 없이 변경하지 않는다.
 
-# 32. 개인정보 보호
+## 32. 개인정보 보존과 삭제
 
-서버에서 장기 보관하지 않을 데이터:
+다음은 초기 운영 정책이며 공개 알파 전 사용자 안내와 실제 저장소·백업 설정을 일치시킨다.
 
-```text
-Raw IP
-Join Ticket
-Host Tunnel Token
-Relay Session Token
-Session Mapping
-```
+| 데이터 | 보존 정책 | 접근·삭제 |
+| --- | --- | --- |
+| 원본 IP | 일반 로그에 미기록, 제한 카운터는 정책 시간창까지만 | 네트워크 연결 자체의 IP 처리는 필요 |
+| 별도 보안 IP 로그 | 기본 비활성, 사건 대응 시 최대 24시간 | 제한된 운영 역할, 자동 만료 |
+| Join·Host 토큰 원문 | 생성·전달 시 메모리에서만 취급 | 로그·분석·백업 제외 |
+| 토큰 해시·Admission 세부정보 | 유효기간과 정리 완료 후 최대 24시간 | 무효화 상태는 유지, 원문 복구 불가 |
+| 세션 매핑·종료 Room 메타데이터 | 종료 후 최대 24시간 | 익명 집계와 분리 |
+| WorldProfile·WorldBan | 프로필 유지 또는 Ban 만료·해제까지 | 호스트 소유권 검사, 삭제 요청 처리 |
+| 신고·제재·관리 감사 기록 | 기본 90일 | 검토자 접근 제한, 보존 예외는 근거·만료 기록 |
+| 성능 로그 | 기본 7일 | 토큰·UUID·IP 제거 |
+| 익명 집계 | 기본 90일 | 개인 식별·재연결 가능성을 검토 |
 
-보안 목적의 IP Log 역시 필요한 기간만 보관한다.
+가명 ID와 IP 해시는 자동으로 익명정보가 되는 것이 아니다. 속도 제한용 IP 파생값에도 짧은 만료와 목적 제한을 적용한다.
 
-일반 통계는 가능한 경우 익명화된 집계 데이터로 전환한다.
+계정·프로필 삭제는 활성 세션을 먼저 철회하고 작업 큐로 실제 저장소에서 삭제한다. DB 백업의 보존은 최대 30일을 초기값으로 하며, 복원 시 삭제·만료 기록을 재적용한다. 24시간 삭제 정책을 가진 토큰·세션·IP 임시 데이터는 장기 복구 백업에서 제외한다. 이를 위해 영속 테이블만 허용하는 논리 백업이나 별도 임시 저장 영역을 사용한다. 물리 스냅샷·WAL·공급자 자동 백업이 이 분리를 무효화하지 않는지 ADR-006에서 확인한다. 외부 로그·CDN 공급자 보존도 점검한다.
 
-예:
+## 33. 로그·지표·알림
 
-```text
-지역별 사용자 수
-평균 Room 유지시간
-평균 플레이어 수
-Relay 사용량
-평균 Session 시간
-```
+로그에는 timestamp, requestId, action, resultCode, relayRegion과 필요한 최소 내부 식별자만 기록한다. 티켓, 비밀번호, 인증 헤더, 원본 자격, 전체 packet payload, 로컬 월드 경로는 기록하지 않는다. Mod 오류 보고서도 같은 기준으로 정제하고 외부 전송 전 사용자가 확인할 수 있게 한다.
 
----
+0.1 필수 지표:
 
-# 33. 로그 정책
+- 방 생성·입장 성공률과 단계별 실패 사유.
+- 입장 소요시간 p50/p95, 구간 RTT, Host tick 지연의 별도 관측.
+- ACTIVE·UNHEALTHY Room, 예약·연결·입장 완료 세션 수.
+- 슬롯 조정 불일치, 철회 확인 지연, 만료 정리 지연.
+- Relay CPU·메모리·큐 크기·세션 수·방향별 바이트 수.
+- DB·Redis·인증 공급자 오류율과 지연.
+- 월 예상 비용, 예산 임계치, 수용량 초과로 거절된 요청.
 
-필요한 정보만 기록한다.
+roomId·userId를 모든 시계열 label에 넣어 지표 수를 무한히 늘리지 않는다. 인증 오류 급증, Relay 생존 실패, 자원 80% 지속 사용, 예산 임계치에 경보를 설정한다. 초기 대상 수용량과 경보 지속시간은 부하 시험 결과로 ADR-005에 기록한다.
 
-보안 로그 예:
+## 34. 장애 처리표
 
-```text
-Timestamp
-Anonymous / Internal User ID
-Action Type
-Result
-Relay Region
-Abuse Flag
-```
+| 상황 | 신규 작업 | 기존 ACTIVE 세션 | 복구 |
+| --- | --- | --- | --- |
+| 인증 공급자 장애 | 새 소유 증명 중지, 유효 서비스 세션도 게임 로그인 조건 확인 | 공급자 장애만으로 즉시 종료하지 않음 | 유효기간 안에서 정상 인증 재시도 |
+| API·DB 장애 또는 승인 상태 불명 | 생성·예약·티켓 소비 중지 | 마지막 Control 승인 후 최대 120초 | DB 상태와 Relay 실연결 대조 후 승인 갱신 |
+| Redis 장애·캐시 소실 | 신규 생성·참가 일시 중지, 오래된 목록은 상태 표시 | DB 승인 갱신 가능하면 유지 | 제한 상태와 캐시 복구, 소비 기록은 DB 유지 |
+| Relay 프로세스·노드 장애 | 해당 Relay 배정 중지 | 해당 연결 종료 | 새 Relay 또는 복구 노드, 세대 변경 후 재참가 |
+| 개별 Host 데이터 연결 단절 | 다른 참가에는 영향 없음 | 해당 연결 종료·슬롯 반환 | 해당 참가자가 새 승인으로 재참가 |
+| Host 전체 단절·Crash | 해당 방 참가 중지 | 해당 방의 게임 연결 종료 | 단절 확정 후 30초 경과 시 만료, 새 Room으로 재개설 |
+| Host 절전·네트워크 변경 | 해당 방 참가 중지 | 끊어진 세션 종료 | 명시적으로 재개설, 자동으로 월드 공개하지 않음 |
+| Player 연결 끊김 | 다른 참가에는 영향 없음 | 해당 슬롯 반환 | 새 티켓으로 참가 |
+| Backend만 일시 단절, 게임 터널 정상 | 신규 참가 중지, 목록은 15초 감지 + 최대 5초 조정 이내 비활성 | 최대 120초 유예 | 같은 유효 세대인지 확인하고 상태 조정 |
 
-민감한 값:
+Relay를 재배정해도 기존 TCP 게임 세션이 자동으로 이어지지 않는다. 0.1은 안내 후 재접속하며 session migration은 출시 약속이 없는 연구 과제다.
 
-```text
-Token
-Password
-Raw Authentication Credential
-Full Packet Payload
-```
+복구 시 Room 상태·세대·승인 슬롯과 Relay 연결을 비교한다. 승인 없는 연결은 종료하고, 실제 연결이 없어진 슬롯은 정리한다. Host의 로컬 미동기화 Ban·종료 요청을 반영한 후 신규 입장을 연다.
 
-등은 일반 로그에 기록하지 않는다.
+서비스 복구 절차에는 신규 입장 전역 중지, Relay drain, 전체 방 종료, 인증 자격 회전, DB 복원 후 모든 임시 승인의 무효화를 포함한다. DB 복원으로 이전 세션을 재승인하지 않는다. 백업 복원 시 영속적인 서비스 epoch를 변경하고 기존 Relay의 종료 확인 또는 기존 승인 만료 후 새 승인을 시작한다.
 
----
+## 35. 저장소 구조
 
-# 34. 장애 처리
+구현 시작 시 다음 Monorepo 구조를 만든다. 현재 이 디렉터리들이 존재하거나 코드가 구현되었다는 뜻은 아니다.
 
-다음 상황을 고려한다.
-
-## Relay 장애
-
-```text
-Relay 장애 감지
-→ 해당 Relay 신규 Room 할당 중단
-→ Backend 상태 갱신
-→ 새로운 Relay 할당
-```
-
-향후에는 기존 Session Migration도 검토할 수 있다.
-
-## Backend 장애
-
-이미 연결된 게임 Session은 가능한 경우 즉시 종료되지 않도록 Control Plane과 Data Plane을 분리한다.
-
-## Host Crash
-
-```text
-Host Tunnel 종료
-→ Room UNHEALTHY
-→ 신규 Join 중단
-→ Room 만료
-```
-
----
-
-# 35. 프로젝트 저장소 구조
-
-권장 Monorepo 구조:
-
-```text
-publicroom/
-│
-├─ mod/
-│  └─ Minecraft Fabric Mod
-│
-├─ api/
-│  └─ Control Backend
-│
-├─ relay/
-│  └─ Relay Server
-│
-├─ protocol/
-│  └─ Shared Protocol Definition
-│
-├─ web/
-│  └─ Admin Dashboard
-│
-├─ infrastructure/
-│  └─ Docker / Deployment / IaC
-│
-├─ tests/
-│
+~~~text
+open-mc-server/
+├─ mod/                 Fabric Mod와 Host/Player 어댑터
+├─ api/                 인증·Room·Admission·운영 API
+├─ relay/               TLS 제어·데이터 중계
+├─ protocol/            스키마·버전·공통 계약 fixture
+├─ web/                 후속 운영 Dashboard
+├─ infrastructure/      로컬 환경·배포·모니터링·IaC
+├─ tests/               통합·동시성·장애·성능 시나리오
 └─ docs/
-```
+   ├─ adr/              결정과 대안·실험 근거
+   ├─ runbooks/         장애·배포·복구·비용 대응
+   └─ validation/       버전별 시험 환경·결과
+~~~
+
+CI는 재현 가능한 빌드, 스키마 검증, 핵심 단위·통합 검사와 비밀정보 유입 검사를 수행한다. 실제 계정·외부 공급자가 필요한 확인은 일반 CI와 분리된 통제된 검증 환경에서 수행한다.
+
+## 36. 기술 스택과 선택 기준
+
+| 영역 | 기본 검토안 | 확정 조건 |
+| --- | --- | --- |
+| Mod | Java + Fabric | ADR-002/003 연결·버전 실험 통과 |
+| API | TypeScript + Fastify | Auth adapter 연동, DB 트랜잭션·부하 검증 |
+| Relay | Go | 세션 격리·제한 버퍼·TLS·장시간 자원 측정 통과 |
+| 영속 저장 | PostgreSQL | 승인·슬롯·세대·밴의 일관된 트랜잭션 |
+| 캐시·제한 | Redis | 소실·재시작 시 안전한 복구 |
+| 배포 | Linux 컨테이너 | 서비스별 자원 격리와 비밀정보 관리 |
+
+Rust 또는 API의 Go 통합은 기본안을 충족하지 못하는 구체적인 근거가 있을 때 비교한다. 언어 자체의 성능 기대만으로 재작성하지 않는다.
+
+정확한 런타임·라이브러리 버전은 구현 시작 시 공식 지원 범위와 보안 상태를 확인해 lockfile·빌드 설정에 고정한다. 애플리케이션 구분은 모듈부터 시작하며 인증·Room·Abuse를 처음부터 별도 마이크로서비스로 쪼개지 않는다.
+
+## 37. API 계약
+
+0.1 API 초안:
+
+~~~text
+POST   /v1/auth/challenges
+POST   /v1/auth/session
+POST   /v1/auth/session/refresh
+DELETE /v1/auth/session
+
+GET    /v1/world-profiles
+POST   /v1/world-profiles
+DELETE /v1/world-profiles/{profileId}
+GET    /v1/world-profiles/{profileId}/bans
+POST   /v1/world-profiles/{profileId}/bans
+DELETE /v1/world-profiles/{profileId}/bans/{playerUuid}
+
+GET    /v1/rooms
+POST   /v1/rooms
+GET    /v1/rooms/{roomId}
+PATCH  /v1/rooms/{roomId}
+DELETE /v1/rooms/{roomId}
+POST   /v1/rooms/{roomId}/heartbeat
+POST   /v1/rooms/{roomId}/host-token
+POST   /v1/rooms/{roomId}/join
+GET    /v1/admissions/{admissionId}
+DELETE /v1/admissions/{admissionId}
+POST   /v1/rooms/{roomId}/players/{playerUuid}/kick
+POST   /v1/rooms/{roomId}/report
+POST   /v1/users/{playerUuid}/report
+~~~
+
+내부 전용 API는 공개 엔드포인트와 분리한다. Relay 등록·준비 완료·Admission 소비·입장 완료·상태 보고·Control 승인 갱신·종료 확인의 각 계약을 protocol/에 정의한다.
+
+0.2에서 Room Code·검색 조건, 0.3에서 friends·invite API를 추가한다. 운영자의 조회·강제 종료·계정 제한 API는 역할 검사를 갖춘 별도 운영 경로로 제공한다.
+
+공통 규칙:
+
+- 생성·참가·제재 요청에는 범위가 정해진 멱등 키를 적용한다. 같은 키에 다른 본문이면 거절한다.
+- 소유자 변경은 지원하지 않으며 profileId·roomId·admissionId마다 객체 권한을 검사한다.
+- 상태 갱신에는 generation과 revision을 사용해 오래된 요청을 거절한다.
+- 오류 응답은 code, messageKey, requestId, retryAfterSeconds로 통일한다. 작업 복구가 필요하면 해당 사용자가 접근 가능한 admissionId 또는 operationId를 추가한다.
+- ROOM_FULL, ROOM_UNAVAILABLE, VERSION_MISMATCH, AUTH_REQUIRED, BANNED, TICKET_EXPIRED, REISSUE_REQUIRED, RELAY_UNAVAILABLE, RATE_LIMITED를 구분한다.
+- 비공개 객체의 존재를 불필요하게 공개하지 않는다. 사용자 안내에 내부 DB·토큰 오류를 그대로 노출하지 않는다.
+- 비동기 종료는 202와 작업 상태로 응답하고 적용 확인 후 완료 상태를 제공한다.
+- heartbeat만으로 호스트 소유권과 게임 준비 상태를 만들지 않는다.
+- 삭제된 객체에 대한 재시도는 이미 종료·삭제된 결과로 수렴한다.
+
+## 38. 개발 단계와 통과 조건
+
+단계는 작업 순서이며 기능의 출시 버전은 39~43절을 따른다.
+
+| 단계 | 수행 작업 | 다음 단계 진입 조건 |
+| --- | --- | --- |
+| Phase 0 — 핵심 실험 | 계정 소유 검증, 고정 버전 선택, Integrated Server 어댑터, 단일 Relay 실제 게임 연결 | ADR-001~004 기록, 다른 네트워크의 두 클라이언트가 30분 플레이, 게임 UUID 일치와 외부 리스너 비노출 확인 |
+| Phase 1 — 승인과 상태 | Room·WorldProfile·Admission·Ban, 트랜잭션 정원, 티켓, 세대, 종료·조정 작업 | 동시 승인·예약 만료·철회·재시작 시나리오 통과 |
+| Phase 2 — 최소 사용자 흐름 | 공개방 목록·생성·참가·종료 UI, 단계별 오류·취소, 백업·Kick·Ban·Report | 실제 연결을 이용한 전체 흐름, 방 종료 후 싱글플레이 유지·백업 복원 확인 |
+| Phase 3 — 0.1 공개 알파 준비 | 제한·모니터링·운영 도구·개인정보 삭제·장애 안내·비용 산정 | ADR-005~006 확정, 48절 필수 기준 충족, 지원·제한·복구 문서 준비 |
+| Phase 4 — 제한 공개 알파 | 승인된 수용량 내 운영, 사용자 피드백과 실패·비용 관찰 | 다음 확장을 위한 문제·용량 근거 확보 |
+| Phase 5 — 0.2~0.4 | 검색·비공개방·소셜·고급 호환성 순차 추가 | 각 버전의 추가 정책·회귀 기준 통과 |
+| Phase 6 — 1.0 운영 | 복수 Relay·다중 지역·자동 용량 배정·업데이트·복구 운영 | 다중 노드·지역 장애와 운영 SLO 검증 |
+
+Phase 0은 격리된 개발 환경이다. 인증 검증이 끝나기 전 공개 서비스로 제공하지 않는다. UI를 가짜 데이터로 먼저 완성하는 것은 주요 완료 조건이 아니다.
+
+## 39. PublicRoom 0.1 MVP
+
+제품 버전 이름은 Open MC Server 0.1이며, 기존 문서 링크를 위해 이 절의 PublicRoom 제목을 유지한다.
+
+첫 제한 공개 테스트에 반드시 포함할 기능:
+
+| 영역 | 0.1 필수 범위 |
+| --- | --- |
+| Mod | 목록·상세·생성·참가·종료, 오류·취소·진행 표시 |
+| 네트워크 | 양쪽 Mod, Relay Only, 구간 TLS, Host outbound, loopback 어댑터 |
+| 인증 | 검증된 계정, 서비스 세션, 티켓과 실제 게임 UUID 연결 |
+| 승인 | 단기 일회성 티켓, 원자적 소비·정원 예약, Host 등록, generation |
+| 생명주기 | 준비 완료 후 게시, unhealthy 숨김, 만료·종료, 복구 후 상태 조정 |
+| 월드 보호 | 백업 선택·복원 확인, 참가자 기본 비OP, 신규 참가 중지 |
+| 관리 | Kick·기간제/지속 Ban·해제·Report, WorldProfile별 Ban 유지 |
+| 호환성 | 정확한 Minecraft·Fabric 지원 조합과 PublicRoom 프로토콜 검사 |
+| 운영 | 한 지역의 제한된 Relay 수용량, 전송량 제한, 핵심 지표·알림·예산 제한 |
+| 운영 도구 | 신고 조회·수동 제재·방 종료·전역 신규 입장 중지, 감사 기록 |
+| 정보 | 호스트 포함 현재·최대 인원, 예약 수, 버전, 명시적인 지연 추정 |
+| 개인정보 | 로그 정제, 보존기간·삭제 작업·백업 적용 검증 |
 
----
+운영 도구는 권한이 분리된 내부 CLI/API로 시작할 수 있다. 그래픽 Dashboard는 1.0 전까지 개선하되 신고를 처리할 수 없는 상태로 공개하지 않는다.
 
-# 36. 기술 스택 후보
+0.1 제외: 검색·태그·사용자 정렬, 비밀번호·비공개방·Room Code, 친구·초대, 임의 Mod팩 검사, 자동 Mod 설치, P2P, 상시 호스팅, 호스트 이전, 세션 migration, 다중 지역 고가용성.
 
-## Minecraft Mod
+## 40. PublicRoom 0.2
 
-```text
-Java
-Fabric
-```
+- 방 이름·호스트·태그 검색, 필터·사용자 정렬.
+- PUBLIC/UNLISTED와 OPEN/PASSWORD의 조합.
+- Room Code 생성·회전·만료.
+- 즐겨찾기·최근 참가.
+- 배포된 Relay 지역이 복수일 때만 수동 지역 선택.
 
-## Control Backend
+코드·비밀번호 추측 제한, 비공개 상세 조회 권한, 정책 변경에 따른 예약 취소를 검증한다. 검색 인덱스에서도 종료·비공개 방이 남지 않도록 한다.
 
-```text
-TypeScript
-Fastify
-```
+## 41. PublicRoom 0.3
+
+- 친구 관계, 초대, FRIENDS·INVITE_ONLY, Host 승인.
+- 사용자 차단과 Presence 공개 설정.
+- 제재 이의 제기와 운영 검토 UX 개선.
 
-또는:
+친구 해제·차단·초대 철회가 신규 예약·티켓 소비에 반영되는지 검증한다. 메시지·알림 전송은 수신자의 설정과 제한을 따른다.
 
-```text
-Go
-```
+## 42. PublicRoom 0.4
 
-## Database
+- 필수 Mod와 Loader manifest 비교, 접속 전 차이 설명.
+- 지원 조합 확장과 버전별 회귀 검증.
+- 여러 지역이 운영되는 경우 측정 기반 자동 지역 선택.
+- 설정 Preset과 WorldProfile을 이용한 재개설 편의.
+
+기본 버전 확인은 이미 0.1 기능이다. 이 단계는 고급 모드 호환성과 사용 편의 확장이다.
+
+## 43. PublicRoom 1.0
 
-```text
-PostgreSQL
-```
+- 복수 Relay·다중 지역, drain·부하 배정·장애 노드 제외.
+- 실측에 근거한 자동 용량 조정과 비용 제한.
+- 운영자 Dashboard와 개선된 Abuse 검토.
+- 안정적인 배포·업데이트·롤백, 데이터 복원과 지역 장애 대응.
+- 사용 환경별 접속 성공률과 지연·가용성 SLO.
+- 개인정보 삭제·로그 정제·보존기간의 지속 점검.
+
+DDoS 기본 보호, 모니터링, 알림, 기본 운영 도구와 개인정보 정책은 0.1부터 필수다. 1.0은 운영 규모와 신뢰성의 확장이다. 세션 migration과 Relay에 대한 종단간 암호화는 별도 검증 없이 1.0 약속에 포함하지 않는다.
+
+## 44. 보안 핵심 원칙
+
+1. 서비스가 관리하는 게임 경로는 Relay Only이며 직접 연결 fallback을 제공하지 않는다.
+2. Host의 게임 수신 지점은 외부 인터페이스에 공개하지 않는다.
+3. 서비스 API·게임 전달 메타데이터에 상대 사용자 실제 IP를 넣지 않는다.
+4. 운영 인프라의 IP 처리와 외부 모드 통신의 보호 한계를 명시한다.
+5. UUID 입력이 아니라 공급자 검증 결과로 계정을 식별한다.
+6. 승인된 UUID와 게임 로그인 UUID의 일치 전에는 게임 입장을 완료하지 않는다.
+7. 티켓 소비·정원 예약·세대·밴·종료 정책은 일관된 승인 경로에서 처리한다.
+8. Host·Player·Relay·운영자 역할의 자격을 구분한다.
+9. 권한이나 상태를 검증할 수 없으면 신규 참가를 중지한다.
+10. 기존 연결의 장애 유예와 철회 지연은 최대 120초로 제한한다.
+11. 게임 내용 검증과 터널 자원 제한을 구분하며 모든 공격 차단을 보장하지 않는다.
+12. Room 종료·세대 변경·복원으로 폐기한 권한은 되살리지 않는다.
+13. 공개 DTO는 명시적 허용 필드만 사용하고 내부 자격을 제외한다.
+14. 로그·백업·오류 보고서에도 개인정보 최소 보존을 적용한다.
+15. 인증된 클라이언트의 게임 입력과 호스트 보고 수치도 무조건 신뢰하지 않는다.
+
+## 45. 프로젝트 우선순위
 
-## Ephemeral State
-
-```text
-Redis
-```
-
-용도:
-
-- Room Presence
-- Heartbeat
-- Rate Limit
-- Join Ticket Nonce
-- Session 상태
-
-## Relay
-
-후보:
-
-```text
-Rust
-```
-
-또는
-
-```text
-Go
-```
-
-Relay에서는 대량의 동시 Connection과 네트워크 I/O가 중요하다.
-
----
-
-# 37. API 기능
-
-예시 API:
-
-```text
-POST   /auth/session
-
-GET    /rooms
-POST   /rooms
-GET    /rooms/{roomId}
-DELETE /rooms/{roomId}
-
-POST   /rooms/{roomId}/heartbeat
-POST   /rooms/{roomId}/join
-
-POST   /rooms/{roomId}/report
-POST   /users/{userId}/report
-
-POST   /room-codes/{code}/join
-```
-
-향후:
-
-```text
-GET    /friends
-POST   /friends/request
-POST   /friends/accept
-
-POST   /rooms/{roomId}/invite
-```
-
----
-
-# 38. 개발 단계
-
-## Phase 0 — Prototype
-
-목표:
-
-- Fabric Mod 기본 구조
-- UI 삽입
-- Integrated Server 테스트
-- Minecraft 자동 접속 테스트
-
----
-
-## Phase 1 — PublicRoom UI
-
-구현:
-
-- 공개방 메뉴
-- Room 리스트
-- Room 상세 화면
-- Room 생성 화면
-- 가짜 데이터 기반 UI
-
-이 단계에서는 실제 Backend 연결 없이 UI를 완성한다.
-
----
-
-## Phase 2 — Room Backend
-
-구현:
-
-- Room REST API
-- PostgreSQL
-- Redis
-- Room 생성
-- Room 삭제
-- Heartbeat
-- Room 검색
-
----
-
-## Phase 3 — Relay Prototype
-
-구현:
-
-```text
-Host
-→ Relay
-→ Client
-```
-
-Minecraft TCP Stream을 Relay를 통해 전달하는 기능을 먼저 검증한다.
-
----
-
-## Phase 4 — One-click Join
-
-구현:
-
-- Join Ticket
-- Relay Session
-- 자동 Minecraft 연결
-- Room 선택 → 참가 흐름 완성
-
----
-
-## Phase 5 — Security MVP
-
-구현:
-
-- Minecraft 계정 인증
-- Relay Only 정책
-- Host Tunnel Token
-- Join Ticket Replay 방지
-- Rate Limit
-- Room 생성 제한
-- Session Timeout
-
----
-
-## Phase 6 — Public Alpha
-
-구현:
-
-- 공개 Room 운영
-- 검색
-- 태그
-- Kick
-- Ban
-- Report
-- Abuse 관리
-- 관리자 Dashboard
-
----
-
-## Phase 7 — Relay Cluster
-
-구현:
-
-- Multi Relay
-- 지역별 Relay
-- Relay 상태 Monitoring
-- 자동 Relay 선택
-- 장애 서버 제외
-
----
-
-## Phase 8 — Social
-
-구현:
-
-- 친구
-- 초대
-- Room Code
-- Friends Only
-- Invite Only
-- Password Room
-
----
-
-## Phase 9 — Compatibility
-
-구현:
-
-- Mod 정보 확인
-- Mod List Hash
-- Loader 확인
-- Version Compatibility 검사
-
----
-
-## Phase 10 — Production
-
-구현:
-
-- Auto Scaling
-- Multi-region
-- DDoS Protection
-- Abuse Detection
-- Monitoring
-- Alert
-- 관리자 운영 도구
-- 장애 자동 복구
-
----
-
-# 39. PublicRoom 0.1 MVP
-
-첫 공개 테스트 버전에 포함할 기능:
-
-## Minecraft Mod
-
-- 공개방 메뉴
-- Room 목록
-- Room 생성
-- Room 종료
-- Room 참가
-- Room 상세 정보
-
-## Networking
-
-- Integrated Server 공개
-- Relay Only 연결
-- Host Outbound Tunnel
-- 원클릭 참가
-
-## Security
-
-- Host IP 보호
-- 참가자 IP 보호
-- Join Ticket
-- Host Tunnel Token
-- Ticket 재사용 방지
-- Connection Timeout
-- 기본 Traffic Limit
-
-## Backend
-
-- 사용자 인증
-- Room API
-- Heartbeat
-- Room 자동 만료
-- Relay 할당
-
-## Abuse Protection
-
-- 계정당 공개 Room 1개
-- Room 생성 Rate Limit
-- Join Rate Limit
-
-## Basic Moderation
-
-- Kick
-- Report
-
-## Information
-
-- 현재 플레이어 수
-- 최대 플레이어 수
-- Minecraft 버전
-- Ping
-
----
-
-# 40. PublicRoom 0.2
-
-추가 기능:
-
-- 방 검색
-- Room 태그
-- 정렬 및 필터
-- 비밀번호 Room
-- UNLISTED Room
-- Room Code
-- 즐겨찾기
-- 최근 참가
-- Relay 지역 선택
-
----
-
-# 41. PublicRoom 0.3
-
-Social 기능:
-
-- 친구
-- 친구 요청
-- 친구 초대
-- Friends Only Room
-- Invite Only Room
-- Host 참가 승인
-- 사용자 차단
-- 강화된 Moderation
-
----
-
-# 42. PublicRoom 0.4
-
-호환성 및 편의 기능:
-
-- Mod 호환성 검사
-- Required Mod 표시
-- Minecraft Loader 검사
-- Relay 자동 지역 선택
-- Room 설정 Preset
-- Room 재생성 편의 기능
-
----
-
-# 43. PublicRoom 1.0
-
-Production 수준 목표:
-
-- Multi-region Relay Cluster
-- Auto Scaling
-- DDoS Protection
-- Abuse Scoring
-- Monitoring
-- Alerting
-- 운영자 Dashboard
-- 자동 장애 대응
-- 개인정보 최소 보존
-- 안정적인 업데이트 시스템
-- Relay Load Balancing
-- Room Discovery 최적화
-
----
-
-# 44. 보안 핵심 원칙
-
-PublicRoom은 다음 원칙을 프로젝트 전체에서 유지한다.
-
-1. 공개방에서는 P2P를 사용하지 않는다.
-2. Host는 외부에 Port를 열지 않는다.
-3. 참가자는 Host IP를 전달받지 않는다.
-4. Host 역시 참가자 IP를 직접 알 필요가 없다.
-5. 모든 참가에는 단기 Join Ticket을 사용한다.
-6. Ticket은 일회성으로 사용한다.
-7. Host와 Relay 연결에도 별도의 인증 Token을 사용한다.
-8. Room 생성은 인증된 Minecraft 계정만 허용한다.
-9. Rate Limit은 Account, Session, IP를 복합적으로 사용한다.
-10. Control Plane과 Relay Data Plane을 분리한다.
-11. Relay에서 공격 Traffic을 Host에 도달하기 전에 차단한다.
-12. Room 종료 후 모든 Token과 Session을 폐기한다.
-13. Database Model을 그대로 Public API로 노출하지 않는다.
-14. Raw IP와 Token 등 민감정보는 최소한으로 저장한다.
-15. Minecraft Client에서 전달되는 데이터는 신뢰하지 않는다.
-
----
-
-# 45. 프로젝트 우선순위
-
-개발 및 제품 결정의 우선순위는 다음과 같이 설정한다.
-
-```text
-1. IP Privacy
-2. 안전한 Network Architecture
-3. 안정적인 연결
-4. 간편한 Room 생성 및 참가
-5. 공개방 Discovery
-6. Abuse / Spam / DDoS 대응
-7. Moderation
-8. Social 기능
-9. Mod Compatibility
-10. 추천 및 고급 기능
-```
-
----
-
-# 46. 최종 제품 정의
-
-> **PublicRoom은 Minecraft 싱글플레이 월드를 포트포워딩 없이 공개하고, 중앙 공개방 목록에서 다른 사용자가 해당 월드를 찾아 원클릭으로 참가할 수 있도록 하는 멀티플레이 플랫폼이다. 공개방의 모든 네트워크 연결은 Relay를 통해 중계하여 Host와 참가자의 실제 IP를 서로 노출하지 않으며, 인증·일회성 Join Ticket·Rate Limit·Room Lifecycle·Abuse Protection을 통해 공개 서비스 환경에서 발생할 수 있는 보안 위협을 최소화한다.**
-
-핵심 구조는 다음 세 요소를 중심으로 유지한다.
-
-```text
-Minecraft Mod
-      +
-Room Directory / Control Backend
-      +
-Privacy Relay Network
-```
-
-이 세 요소를 먼저 안정적으로 완성한 후 친구, 초대, Mod 호환성, 추천 시스템 등의 부가 기능을 확장한다.
+1. 계정 소유·게임 신원 연결과 IP 보호 경계.
+2. Integrated Server와 Relay 실제 연결 검증.
+3. 정원·티켓·종료·장애 처리의 일관성.
+4. 월드 보호와 최소 관리·운영 기능.
+5. 간편한 생성·목록·참가 UX.
+6. 측정 가능한 성능·수용량·비용.
+7. 검색·비공개방.
+8. 친구·초대·고급 모드 호환성.
+9. 다중 지역과 운영 규모 확대.
+
+앞 단계의 출시 조건을 충족하지 못하면 뒷 단계의 기능 수로 완료를 대체하지 않는다.
+
+## 46. 최종 제품 정의
+
+> Open MC Server는 Minecraft Java Edition의 싱글플레이 월드를 포트포워딩 없이 공개하고, 목록에서 찾아 참가하는 Mod·Control Backend·Relay 플랫폼이다. 서비스가 관리하는 연결에서는 상대 사용자에게 실제 IP를 전달하지 않으며, 검증된 계정과 게임 신원 연결, 일회성 참가 승인, 정원 예약, 월드 보호, 제한된 장애 유예와 운영 정책을 함께 제공한다.
+
+호스트 PC가 월드를 실행한다는 조건, Relay 운영 인프라가 접속 IP를 처리한다는 조건, 0.1의 단일 지역·제한된 지원 조합을 제품 안내에 포함한다.
+
+## 47. 구현 전 결정 기록과 미확정 항목
+
+아래 항목은 설계의 불확실성을 숨기지 않기 위한 통과 조건이다. ADR 파일은 실제 실험·선택을 수행할 때 생성하며, 문서에 기본안을 적었다는 이유로 검증 완료로 취급하지 않는다. 각 기록에는 담당자, 상태, 검토일, 대안, 선택 근거, 실험 환경·결과, 변경 영향을 포함한다.
+
+| ID | 결정 | 현재 기본안 / 미확정 내용 | 완료 시점과 증거 |
+| --- | --- | --- | --- |
+| ADR-001 | 계정 인증 | 정식 런처 세션 기반 공급자 검증. 지원 API·challenge 검증·권한·IP 비공개 양립 미확정 | Phase 0, 소유 검증→서비스 세션→게임 UUID 일치와 실패 시 거절 확인 |
+| ADR-002 | Integrated Server 연결 | loopback 어댑터 우선. 로그인·암호화·일시정지·리스너 정리 영향 미검증 | Phase 0, 두 네트워크 실제 플레이와 방 종료·리스너 범위 확인 |
+| ADR-003 | 지원 버전 | Java Edition 한 릴리스 + Fabric/JDK 고정 조합. 정확한 버전 미선정 | Phase 0, 재현 빌드·클라이언트 두 대·지원표 |
+| ADR-004 | 터널·스택·승인 계약 | TLS/TCP, 참가자별 데이터 연결, TypeScript API·Go Relay, DB 승인 기본안 | Phase 0 초안, Phase 1 확정. 연결 격리·동시 승인·지연·버퍼 증거 |
+| ADR-005 | 배포·수용량·예산 | 한 지역 제한 알파. 공급자·단가·월 예산·최대 Room/세션 미확정 | 공개 알파 전, 실제 견적·과금 단위·부하·장애 복구 결과 |
+| ADR-006 | 운영·데이터 보존 | 32절 초기 정책, 운영자 역할과 신고·삭제 담당 미지정 | 공개 알파 전, 담당자·알림 수신·실제 삭제·복원·제재 시연 |
+
+ADR-001~003 미완료 상태에서 공개 알파 날짜를 확정하지 않는다. 외부 공급자 기능이 지원되지 않으면 검증을 생략하는 대신 기본안을 변경하고 이 문서의 관련 계약을 함께 수정한다.
+
+## 48. 검증과 출시 완료 기준
+
+현재 아래 결과는 모두 **미실행**이다. 각 결과를 docs/validation/에 버전·빌드·OS·네트워크·장비·부하·측정 시각과 함께 기록한다.
+
+### 48.1 기능·권한·일관성
+
+| ID | 시험 | 통과 조건 |
+| --- | --- | --- |
+| F01 | 서로 다른 네트워크의 Host/Player | 포트포워딩 없이 실제 월드 입장과 30분 플레이 |
+| F02 | 지원 조합 불일치 | 티켓 발급 전 차이 안내, 실제 로그인 단계에서도 불일치 거절 |
+| F03 | 방 생성 실패·중복 요청 | 활성 방·리스너·예약이 중복 생성되거나 남지 않음 |
+| F04 | 같은 티켓·같은 마지막 자리의 동시 승인 | 티켓당 하나의 연결만 승인, 호스트 포함 정원 초과 0건 |
+| F05 | 취소·예약 만료·입장 실패·중복 종료 | 제한시간과 5초 정리 주기 내 슬롯 반환, 이중 차감 0건 |
+| F06 | 게임 UUID와 승인 UUID·generation 불일치 | 게임 입장 전 거절 |
+| F07 | Kick·Ban·방 종료와 참가 요청의 동시 처리 | 정책 확정 뒤 새 소비 거절, 적용 확인 뒤 세션·예약 없음 |
+| F08 | 같은 WorldProfile로 재개설 | UUID Ban 유지, 다른 소유자의 프로필 변경 거절 |
+| F09 | 방 닫기·ESC·월드 나가기 | 공개 중 tick 진행, 닫은 뒤 단독 플레이, 나가기 시 정상 저장 |
+| F10 | 선택 백업·저장 실패·용량 부족·복원 | 일관된 복원 확인, 실패를 성공으로 표시하지 않음 |
+| F11 | 공개 API·게임 전달 메타데이터·일반 로그·오류 보고서 점검 | 금지된 실제 IP·토큰·원본 자격·로컬 경로 노출 0건, 별도 보안 로그는 32절 준수 |
+| F12 | 보존기간 만료·계정 삭제·백업 복원 | 삭제 반영, 복원으로 개인정보·폐기 권한 부활 없음 |
+
+F04와 F07은 격리된 시험 환경에서 정상적인 API 호출의 동시성·순서를 제어해 검증한다. 미지원 외부 대상에 부하를 보내지 않는다.
+
+### 48.2 장애와 복구
+
+- API·DB·Redis 각각의 중단과 재시작에서 34절 정책을 확인한다.
+- API만 60초 중단되었을 때 기존 ACTIVE 게임은 유지하고 신규 참가를 거절한다.
+- Control 승인 중단 120초를 넘기면 Relay가 유예 연결을 종료한다. 시험 허용 오차는 5초다.
+- Host·Relay 단절과 프로세스 재시작에서 유령 방·슬롯·이전 세대 참가권이 남지 않는다.
+- 이벤트 중복·지연·순서 변경 후에도 CLOSED·EXPIRED 상태가 되살아나지 않는다.
+- DB 복원 후 서비스 epoch가 바뀌며 이전 연결을 새 승인으로 오인하지 않는다.
+- 호스트 로컬 Ban이 Backend 복구 후 동기화되기 전 새 참가를 허용하지 않는다.
+- 제한된 알파 환경의 정상 종료·롤백·전역 신규 입장 중지를 운영자가 수행할 수 있다.
+
+### 48.3 성능·수용량 목표
+
+다음은 출시 목표이며 실측 결과가 아니다.
+
+| 지표 | 초기 목표와 조건 |
+| --- | --- |
+| 접속 성공률 | 지원 조합·정상 서비스·여유 정원에서 200회 이상 참가 시도 중 99% 이상 |
+| 참가 소요시간 | 서비스 인증 완료 이후 참가 클릭→게임 입장 p95 15초 이하 |
+| 지연 조건 | 위 시간 측정은 Host–Relay + Client–Relay RTT 합계 100ms 이하에서 수행 |
+| 시험 월드 | 고정 seed·시야 거리·지역 이동 경로를 기록하고 기존 청크와 신규 청크를 구분 |
+| Room 비활성 반영 | heartbeat 신호 상실 후 15초 + 조정 허용 5초 이내 목록 제외 |
+| 정상 철회 반영 | 건강한 Control 경로에서 5초 이내 |
+| 장시간 부하 | 출시 예정 최대 수용량으로 4시간, 부하 종료 후 세션·슬롯 누수 0건 |
+| 자원 여유 | 예상 지속 부하에서 CPU·메모리·회선 각각 배포 상한의 70% 이하 목표 |
+| 느린 연결 | 설정된 큐 상한 유지, 정상 청크 로딩과 다른 참가자의 진행을 함께 확인 |
+
+정상적인 정책 거절은 성공률의 연결 실패와 분리해서 집계하되, 제외 건수·사유도 함께 보고한다. 초기 인증·갱신·청크 로딩·지역 이동의 소요시간과 대역폭도 별도 기록한다. 지원 환경에서 목표를 충족하지 못하면 수용량·전송률·지원 범위를 근거와 함께 조정하고 다시 검증한다.
+
+### 48.4 공개 알파 판정
+
+다음 조건이 모두 충족되어야 0.1을 공개한다.
+
+- ADR-001~006의 필수 결정·담당자·증거가 기록됨.
+- 48.1~48.2 필수 기능과 장애 검증 통과.
+- 48.3 목표에 대한 실측과 승인된 수용량·비용 한도가 존재함.
+- 실제 IP·토큰 노출, 신원 불일치 승인, 정원 초과, 종료 후 재승인 문제의 미해결 항목이 없음.
+- 기본 신고 처리·Ban·전역 입장 중지·경보·삭제 작업이 작동함.
+- 사용자 지원 범위·호스트 종료 조건·구간 암호화·외부 통신 한계 안내가 실제 동작과 일치함.
+
+### 48.5 근거 자료
+
+구현 시에는 선택한 버전의 문서를 다시 확인한다.
+
+- [Fabric Networking](https://docs.fabricmc.net/develop/networking): 논리 클라이언트·서버와 payload 처리 구분 참고.
+- [Yarn IntegratedServer 1.21.1 API](https://maven.fabricmc.net/docs/yarn-1.21.1%2Bbuild.3/net/minecraft/server/integrated/IntegratedServer.html): LAN 공개·서버 생명주기 조사용 예시이며 지원 버전 확정이 아님.
+- [TLS 1.3 표준](https://www.rfc-editor.org/rfc/rfc8446): 구간 암호화의 표준 근거.
+- [TCP/UDP 계층 DDoS 보호](https://developers.cloudflare.com/spectrum/about/ddos-for-spectrum/): HTTP API와 게임 Relay의 보호 계층 구분 참고. 공급자 채택 결정은 아님.
